@@ -1,0 +1,32 @@
+# SyncPilot: Custom-distribution embedded Shopify app.
+# Run 'shopify app config link' to associate with your actual Shopify Dev app.
+# Replace the example application URL and redirect URL before deployment.
+client_id = ""
+name = "SyncPilot"
+application_url = "https://example.com"
+embedded = true
+
+[auth]
+redirect_urls = ["https://example.com/auth/callback"]
+
+[access_scopes]
+scopes = "read_products,write_products,read_inventory,write_inventory,read_locations"
+
+[webhooks]
+api_version = "2026-10"
+
+[[webhooks.subscriptions]]
+topics = ["app/uninstalled"]
+uri = "/webhooks/app/uninstalled"
+
+[[webhooks.subscriptions]]
+topics = ["app/scopes_update"]
+uri = "/webhooks/app/scopes_update"
+
+[[webhooks.subscriptions]]
+topics = ["products/create", "products/update", "products/delete"]
+uri = "/webhooks/products/update"
+
+[[webhooks.subscriptions]]
+topics = ["inventory_levels/update"]
+uri = "/webhooks/inventory/levels/update"
