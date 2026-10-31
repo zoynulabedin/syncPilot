@@ -27,16 +27,16 @@ SyncPilot is a **custom-distribution embedded Shopify app** for authorized Shopi
 ## Local setup
 
 1. Clone the repository and check out `feat/syncpilot-foundation`.
-2. Run `npm install`. Commit the generated `package-lock.json` after reviewing it.
+2. Run `npm ci` (the committed `package-lock.json` ensures reproducible dependencies).
 3. Run `docker compose up -d postgres`.
 4. Copy `.env.example` to `.env` (PowerShell: `Copy-Item .env.example .env`).
 5. Use local database URL: `postgresql://syncpilot:syncpilot_dev_only@localhost:5432/syncpilot?schema=public`.
 6. Run `npx prisma generate` and `npx prisma migrate deploy`.
-7. Run `shopify app config link` to link your own Shopify app and replace example URLs in `shopify.app.toml`.
-8. Run `shopify app dev`. Complete the installation in an authorized development store.
-9. Verify `/app`, `/app/products`, `/app/inventory`, `/app/stores` and `/app/activity`.
+7. Run `shopify app config link` and select the existing SyncPilot app in Shopify Dev Dashboard. If the correct app is already linked, check with `shopify app info` instead.
+8. Run `shopify app dev --store your-development-store.myshopify.com`. The CLI starts a temporary Cloudflare HTTPS tunnel and automatically configures the selected **development store** because `[build].automatically_update_urls_on_dev = true`. Press `p` in the CLI to open the preview and install it.
+9. Verify `/app`, `/app/products`, `/app/inventory`, `/app/stores`, `/app/rules` and `/app/activity`. The example `application_url`/`redirect_urls` in `shopify.app.toml` are not a production configuration; replace them with the real hosted domain before production deployment. The tunnel URL is temporary and might not be written back to TOML.
 
-The sample Docker Compose database password is only for localhost development. Use a proper secret for staging/production. Never commit the real `.env`, tokens, or Shopify API secrets.
+The sample Docker Compose database password is only for localhost development. For webhooks, use the default Cloudflare tunnel (do **not** use `--use-localhost`). `shopify app dev` requires a development store or Shopify Plus sandbox store, not a production customer store. Keep the terminal running while testing. Use a proper secret for staging/production. Never commit the real `.env`, tokens, or Shopify API secrets.
 
 ## Shopify installation across two stores
 
