@@ -6,6 +6,11 @@ name = "SyncPilot"
 application_url = "https://example.com"
 embedded = true
 
+# Shopify CLI will map the temporary Cloudflare tunnel URL to the chosen dev store.
+# The production app URL is not changed by app dev.
+[build]
+automatically_update_urls_on_dev = true
+
 [auth]
 redirect_urls = ["https://example.com/auth/callback"]
 
