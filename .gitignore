@@ -15,10 +15,9 @@ database.sqlite
 
 .env
 .env.*
+!.env.example
 
-package-lock.json
-yarn.lock
-pnpm-lock.yaml
+# Commit the package lockfile when dependencies are installed.
 
 /extensions/*/dist
 
