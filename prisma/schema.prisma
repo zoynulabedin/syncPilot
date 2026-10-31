@@ -91,7 +91,7 @@ model ProductMapping {
   verifiedAt          DateTime?
   createdAt           DateTime @default(now())
 
-  @@unique([sourceShopDomain, sourceProductGid, targetShopDomain])
+  @@unique([sourceShopDomain, sourceProductGid, targetShopDomain], map: "ProductMapping_source_target_unique")
   @@index([workspaceId])
 }
 
@@ -107,7 +107,7 @@ model VariantMapping {
   verifiedAt           DateTime?
   createdAt            DateTime @default(now())
 
-  @@unique([sourceShopDomain, sourceVariantGid, targetShopDomain])
+  @@unique([sourceShopDomain, sourceVariantGid, targetShopDomain], map: "VariantMapping_source_target_unique")
   @@index([workspaceId])
 }
 
@@ -121,7 +121,7 @@ model LocationMapping {
   verifiedAt         DateTime?
   createdAt          DateTime @default(now())
 
-  @@unique([sourceShopDomain, sourceLocationGid, targetShopDomain])
+  @@unique([sourceShopDomain, sourceLocationGid, targetShopDomain], map: "LocationMapping_source_target_unique")
   @@index([workspaceId])
 }
 

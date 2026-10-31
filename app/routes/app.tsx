@@ -22,6 +22,7 @@ export default function App() {
         <s-link href="/app/stores">Stores</s-link>
         <s-link href="/app/products">Products</s-link>
         <s-link href="/app/inventory">Inventory</s-link>
+        <s-link href="/app/rules">Sync Rules</s-link>
         <s-link href="/app/activity">Activity</s-link>
       </s-app-nav>
       <Outlet />

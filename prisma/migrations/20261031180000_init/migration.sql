@@ -163,11 +163,11 @@ CREATE UNIQUE INDEX "ShopConnection_shopDomain_key" ON "ShopConnection"("shopDom
 CREATE INDEX "ShopConnection_workspaceId_idx" ON "ShopConnection"("workspaceId");
 CREATE INDEX "StorePairingRequest_initiatingShop_destinationShop_idx" ON "StorePairingRequest"("initiatingShop", "destinationShop");
 CREATE INDEX "SyncPolicy_workspaceId_idx" ON "SyncPolicy"("workspaceId");
-CREATE UNIQUE INDEX "ProductMapping_sourceShopDomain_sourceProductGid_targetShopDomain_key" ON "ProductMapping"("sourceShopDomain", "sourceProductGid", "targetShopDomain");
+CREATE UNIQUE INDEX "ProductMapping_source_target_unique" ON "ProductMapping"("sourceShopDomain", "sourceProductGid", "targetShopDomain");
 CREATE INDEX "ProductMapping_workspaceId_idx" ON "ProductMapping"("workspaceId");
-CREATE UNIQUE INDEX "VariantMapping_sourceShopDomain_sourceVariantGid_targetShopDomain_key" ON "VariantMapping"("sourceShopDomain", "sourceVariantGid", "targetShopDomain");
+CREATE UNIQUE INDEX "VariantMapping_source_target_unique" ON "VariantMapping"("sourceShopDomain", "sourceVariantGid", "targetShopDomain");
 CREATE INDEX "VariantMapping_workspaceId_idx" ON "VariantMapping"("workspaceId");
-CREATE UNIQUE INDEX "LocationMapping_sourceShopDomain_sourceLocationGid_targetShopDomain_key" ON "LocationMapping"("sourceShopDomain", "sourceLocationGid", "targetShopDomain");
+CREATE UNIQUE INDEX "LocationMapping_source_target_unique" ON "LocationMapping"("sourceShopDomain", "sourceLocationGid", "targetShopDomain");
 CREATE INDEX "LocationMapping_workspaceId_idx" ON "LocationMapping"("workspaceId");
 CREATE UNIQUE INDEX "WebhookEvent_shopDomain_deliveryId_key" ON "WebhookEvent"("shopDomain", "deliveryId");
 CREATE INDEX "WebhookEvent_shopDomain_receivedAt_idx" ON "WebhookEvent"("shopDomain", "receivedAt");
