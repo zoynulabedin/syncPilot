@@ -1,0 +1,186 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Session {
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+
+  @@index([shop])
+}
+
+model Workspace {
+  id          String           @id @default(cuid())
+  name        String
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  connections ShopConnection[]
+}
+
+model ShopConnection {
+  id            String     @id @default(cuid())
+  shopDomain    String     @unique
+  workspaceId   String?
+  workspace     Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+  status        String     @default("CONNECTED")
+  installedAt   DateTime   @default(now())
+  lastSeenAt    DateTime   @default(now())
+  uninstalledAt DateTime?
+
+  @@index([workspaceId])
+}
+
+// WARNING: An installed shop must not be attached to a workspace solely
+// because an admin enters its domain. Pairing requires both-shop authorization.
+model StorePairingRequest {
+  id               String    @id @default(cuid())
+  initiatingShop    String
+  destinationShop   String
+  state             String    @default("PENDING")
+  expiresAt         DateTime
+  verifiedAt        DateTime?
+  createdAt         DateTime  @default(now())
+
+  @@index([initiatingShop, destinationShop])
+}
+
+model SyncPolicy {
+  id                  String   @id @default(cuid())
+  workspaceId         String
+  sourceShopDomain    String
+  targetShopDomain    String
+  direction           String   @default("ONE_WAY")
+  syncProduct         Boolean  @default(false)
+  syncPrices          Boolean  @default(false)
+  syncInventory       Boolean  @default(false)
+  inventoryAuthority  String?
+  enabled             Boolean  @default(false)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@index([workspaceId])
+}
+
+model ProductMapping {
+  id                  String   @id @default(cuid())
+  workspaceId         String
+  sourceShopDomain    String
+  sourceProductGid    String
+  targetShopDomain    String
+  targetProductGid    String
+  verifiedAt          DateTime?
+  createdAt           DateTime @default(now())
+
+  @@unique([sourceShopDomain, sourceProductGid, targetShopDomain])
+  @@index([workspaceId])
+}
+
+model VariantMapping {
+  id                   String   @id @default(cuid())
+  workspaceId          String
+  sourceShopDomain     String
+  sourceVariantGid     String
+  sourceInventoryGid   String?
+  targetShopDomain     String
+  targetVariantGid     String
+  targetInventoryGid   String?
+  verifiedAt           DateTime?
+  createdAt            DateTime @default(now())
+
+  @@unique([sourceShopDomain, sourceVariantGid, targetShopDomain])
+  @@index([workspaceId])
+}
+
+model LocationMapping {
+  id                 String   @id @default(cuid())
+  workspaceId        String
+  sourceShopDomain   String
+  sourceLocationGid  String
+  targetShopDomain   String
+  targetLocationGid  String
+  verifiedAt         DateTime?
+  createdAt          DateTime @default(now())
+
+  @@unique([sourceShopDomain, sourceLocationGid, targetShopDomain])
+  @@index([workspaceId])
+}
+
+model WebhookEvent {
+  id          String   @id @default(cuid())
+  shopDomain  String
+  deliveryId  String
+  topic       String
+  resourceId  String?
+  status      String   @default("RECEIVED")
+  receivedAt  DateTime @default(now())
+  processedAt DateTime?
+
+  @@unique([shopDomain, deliveryId])
+  @@index([shopDomain, receivedAt])
+  @@index([status, receivedAt])
+}
+
+model SyncJob {
+  id          String    @id @default(cuid())
+  workspaceId String
+  policyId    String
+  sourceShop  String
+  targetShop  String
+  eventId     String?
+  operation   String
+  status      String    @default("PENDING")
+  attempts    Int       @default(0)
+  lastError   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  completedAt DateTime?
+
+  @@index([workspaceId, status, createdAt])
+}
+
+model SyncConflict {
+  id          String    @id @default(cuid())
+  workspaceId String
+  jobId       String?
+  code        String
+  details     Json
+  status      String    @default("OPEN")
+  createdAt   DateTime  @default(now())
+  resolvedAt  DateTime?
+
+  @@index([workspaceId, status])
+}
+
+model AuditEvent {
+  id           String   @id @default(cuid())
+  workspaceId  String?
+  shopDomain   String?
+  actor        String
+  action       String
+  resourceType String?
+  resourceId   String?
+  details      Json?
+  createdAt    DateTime @default(now())
+
+  @@index([workspaceId, createdAt])
+}
