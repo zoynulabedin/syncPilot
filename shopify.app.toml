@@ -1,7 +1,7 @@
 # SyncPilot: Custom-distribution embedded Shopify app.
 # Run 'shopify app config link' to associate with your actual Shopify Dev app.
 # Replace the example application URL and redirect URL before deployment.
-client_id = ""
+client_id = "9e4f72655806c046a597fbdd2e2de330"
 name = "SyncPilot"
 application_url = "https://example.com"
 embedded = true
