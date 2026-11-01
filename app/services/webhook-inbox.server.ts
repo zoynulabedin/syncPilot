@@ -9,8 +9,10 @@ export async function recordVerifiedWebhook(
   resourceId?: string,
 ) {
   const deliveryId = request.headers.get("x-shopify-webhook-id");
-  if (!deliveryId) {
-    throw new Response("Missing Shopify webhook delivery identifier", { status: 400 });
+  if (!deliveryId || deliveryId.length > 200) {
+    throw new Response("Missing Shopify webhook delivery identifier", {
+      status: 400,
+    });
   }
   return prisma.webhookEvent.upsert({
     where: { shopDomain_deliveryId: { shopDomain, deliveryId } },

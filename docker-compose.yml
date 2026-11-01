@@ -1,4 +1,17 @@
 services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6380}:6379"
+    volumes:
+      - syncpilot_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
   postgres:
     image: postgres:17-alpine
     restart: unless-stopped
@@ -7,7 +20,7 @@ services:
       POSTGRES_USER: syncpilot
       POSTGRES_PASSWORD: syncpilot_dev_only
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - syncpilot_pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -17,3 +30,4 @@ services:
       retries: 10
 volumes:
   syncpilot_pgdata:
+  syncpilot_redisdata:

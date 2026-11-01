@@ -39,16 +39,17 @@ export default function App() {
         )}
         <ul className={styles.list}>
           <li>
-            <strong>Product feature</strong>. Some detail about your feature and
-            its benefit to your customer.
+            <strong>Verified store connections.</strong> Both owners approve
+            pairing before sharing catalog data.
           </li>
           <li>
-            <strong>Product feature</strong>. Some detail about your feature and
-            its benefit to your customer.
+            <strong>Reviewable changes.</strong> Map stable product identities,
+            choose field ownership, and inspect each dry run.
           </li>
           <li>
-            <strong>Product feature</strong>. Some detail about your feature and
-            its benefit to your customer.
+            <strong>Controlled inventory.</strong> Use explicit source
+            authority, mapped locations, safety buffers, and quantity
+            preconditions.
           </li>
         </ul>
       </div>

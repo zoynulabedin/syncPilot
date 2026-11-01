@@ -31,3 +31,8 @@ database.sqlite
 
 # Local diagnostics (may contain development output)
 /local-check-results/
+/coverage/
+/playwright-report/
+/test-results/
+*.log
+backups/

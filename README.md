@@ -1,116 +1,81 @@
-# SyncPilot — Shopify Product & Inventory Sync
+# SyncPilot
 
-SyncPilot is a **custom-distribution embedded Shopify app** for authorized Shopify stores, built with React Router, TypeScript, Shopify Admin GraphQL (2026-10), and PostgreSQL.
+Private Shopify product and inventory synchronization with verified two-store pairing, persistent catalog imports, explicit mappings, owner-reviewed plans, and a recoverable background worker.
 
-> **Current status: FOUNDATION — NOT PRODUCTION READY.**
-> This branch contains authenticated Shopify app scaffolding, a PostgreSQL schema and migration, read-only product/inventory dashboards, and a verified webhook inbox. **Cross-store pairing, sync workers, product writes, inventory writes, and reconciliation are not implemented.** No live inventory synchronization should be expected.
+**Current release: local approval-based implementation. Production acceptance is incomplete.** Shopify writes are disabled by default. Webhooks and scheduled reconciliation prepare proposals; an owner must approve each exact plan. This is not unattended synchronization or a shared-stock allocation system.
 
-## Features implemented on this branch
+## Implemented
 
-- Official Shopify React Router application foundation and Shopify embedded layout
-- Custom app distribution configuration with separate authenticated installation sessions
-- Store onboarding page (current store only; no unsafe automatic cross-store linking)
-- Read-only products and variants from the current Shopify store
-- Read-only aggregate inventory quantity view
-- Verified webhook receiver and deduplicated event inbox for product and inventory changes
-- Activity inbox and initial PostgreSQL data model
-- Safe default: all SyncPolicy flags disabled
+- Shopify React Router embedded UI with verified online owner identity and separate offline worker sessions.
+- Expiring, hashed pairing challenges; acceptance in the second installation and confirmation by the initiating owner; tenant checks and read-only staff membership.
+- Checkpointed product, variant, location, and per-location inventory imports; searchable catalog and inventory pages.
+- Explicit GID mappings and parent-variant validation. SKU/barcode suggestions never authorize a mapping alone.
+- Source ownership for title, description HTML, vendor, product type, handle, tags, status, variant price, and compare-at price. Reverse policies must own different fields.
+- Exact, expiring dry runs and single-use approvals. Targeted product/price updates; authoritative available-inventory writes with a safety buffer, expected-quantity CAS and Shopify idempotency.
+- Durable PostgreSQL inbox/jobs, leased processing, resource locks, bounded retries, dead letters, conflict review, cancellation and conservative recovery after uncertain writes.
+- Read-only scheduled/on-demand reconciliation, real job/audit views, in-app operational alerts, settings, and help.
+- AES-256-GCM access/refresh token storage with context authentication; generic liveness/readiness probes; local backup and disposable restore rehearsal tools.
 
-## Prerequisites
+## Local development
 
-- Node.js 22.12+
-- npm and Shopify CLI
-- Docker Desktop or local PostgreSQL 17
-- A Shopify app in Shopify Dev Dashboard
-- One or two Shopify development stores (custom distribution supports multiple stores under the same Plus organization)
-
-## Local setup
-
-1. Clone the repository and check out `feat/syncpilot-foundation`.
-2. Run `npm ci` (the committed `package-lock.json` ensures reproducible dependencies).
-3. Run `docker compose up -d postgres`.
-4. Copy `.env.example` to `.env` (macOS: `cp -n .env.example .env`; Windows PowerShell: `Copy-Item .env.example .env`).
-5. Use local database URL: `postgresql://syncpilot:syncpilot_dev_only@localhost:5432/syncpilot?schema=public`.
-6. Run `npx prisma generate` and `npx prisma migrate deploy`.
-7. Run `shopify app config link` and select the existing SyncPilot app in Shopify Dev Dashboard. If the correct app is already linked, check with `shopify app info` instead.
-8. Run `shopify app dev --store your-development-store.myshopify.com`. The CLI starts a temporary Cloudflare HTTPS tunnel and automatically configures the selected **development store** because `[build].automatically_update_urls_on_dev = true`. Press `p` in the CLI to open the preview and install it.
-9. Verify `/app`, `/app/products`, `/app/inventory`, `/app/stores`, `/app/rules` and `/app/activity`. The example `application_url`/`redirect_urls` in `shopify.app.toml` are not a production configuration; replace them with the real hosted domain before production deployment. The tunnel URL is temporary and might not be written back to TOML.
-
-The sample Docker Compose database password is only for localhost development. For webhooks, use the default Cloudflare tunnel (do **not** use `--use-localhost`). `shopify app dev` requires a development store or Shopify Plus sandbox store, not a production customer store. Keep the terminal running while testing. Use a proper secret for staging/production. Never commit the real `.env`, tokens, or Shopify API secrets.
-
-## macOS setup (project on Desktop)
-
-If your local project folder is on your Mac Desktop:
+Requires Node 22.12+, npm, Shopify CLI, and Docker. Run commands from this checkout, not the preserved nested `syncPilot/` folder.
 
 ```bash
-cd ~/Desktop/syncPilot
-git checkout feat/syncpilot-foundation
-git pull origin feat/syncpilot-foundation
 cp -n .env.example .env
+# Set DATABASE_URL to match the local Compose password and POSTGRES_PORT.
+# Set SESSION_ENCRYPTION_KEY once to a base 64-encoded random 32-byte key.
+docker compose up -d --wait postgres redis
+npm ci
+npm run setup
+npm run dev
 ```
 
-Edit `.env` locally with the development PostgreSQL URL. Then:
+Shopify CLI supplies development app credentials and the temporary HTTPS tunnel to both the web process and a separate worker process. Keep it running. `npm run worker` is the standalone worker entry point for deployments with their own environment. Never paste tokens into the UI or commit environment files.
+
+This Mac currently uses PostgreSQL on **5433** and Redis on **6380** to avoid existing host services; its ignored `.env` keeps both database URL and port aligned. A clean checkout defaults PostgreSQL to 5432. Compose binds development dependencies to loopback.
+
+Keep `SYNC_WRITE_ENABLED=false` and `INVENTORY_WRITE_ENABLED=false` through discovery and verification. Production requires `SESSION_ENCRYPTION_KEY` at startup. Preserve that key separately from encrypted session backups. To encrypt existing legacy rows after configuring it:
 
 ```bash
-docker compose up -d postgres
-bash scripts/local-check.sh --with-migration
+npm run sessions:encrypt
 ```
 
-On a successful build, connect the existing Shopify app if necessary with `shopify app config link`, then use:
+## Operator flow
+
+1. Install the same app in two eligible development/sandbox stores or eligible stores in the same Shopify Plus organization.
+2. Both store owners approve pairing in their own installations. Eligibility is attested, not discovered through an organization API.
+3. Import each catalog. Verify product mappings, then variants and locations.
+4. Save a field/authority policy as a draft and run a dry run.
+5. After release approval enables deployment write switches, activate the policy and approve the exact unexpired plan. The worker checks live state again.
+6. Inspect jobs, attempts, conflicts and reconciliation findings. Resolve uncertain outcomes with a fresh comparison rather than replaying old stock approvals.
+
+An authoritative inventory policy needs a business stock model that handles destination sales correctly. Independent pools should not mirror quantities; shared physical pools require a reservation/allocation ledger. Asynchronous copies cannot guarantee zero overselling across independent checkouts.
+
+## Verification
 
 ```bash
-shopify app dev --store your-dev-store.myshopify.com
+npm run check
+npm run test:integration
+npm run test:e 2 e
+bash scripts/backup-local.sh
+bash scripts/restore-drill.sh backups/your-backup.dump
 ```
 
-Shopify CLI runs a development tunnel for the selected development store. The script saves non-sensitive command reports to `local-check-results/`; sanitize logs before sharing them. Do not share your `.env`, API secret, Shopify tokens, or raw customer data.
+`check` runs typecheck, lint, unit tests and build. Integration tests create, migrate and drop a generated local `syncpilot_test_*` database and exercise synthetic Shopify responses, including 10,000 products, concurrency, CAS, duplicate deliveries, interruption and revocation. HTTP smoke tests start the built server with synthetic Shopify credentials and check probes, authentication rejection and forged-webhook rejection; they do not substitute for an authenticated browser/two-store test.
 
-If the Desktop folder is synchronized with iCloud, open Terminal, enter `cd ` (with a trailing space), drag the project folder from Finder into Terminal, and press Return to use its exact path.
+## Deployment and remaining work
 
-## Windows local validation and collaboration
+`Dockerfile` and `docker-compose.production.yml` provide web, worker, PostgreSQL, Redis and a separate migration task. Do not deploy them with development credentials. Configure a separate staging app/domain/secrets, run migrations once, keep write flags off, and complete real two-store acceptance before a production pilot.
 
-After setting up the local `.env` (do not commit it):
+Unsupported: new product creation, variant structure changes, media/metafields/collections, shared-pool ledger allocation, unrestricted two-way inventory, unattended mutation consent, external notification delivery and automatic retention purge. Mapping/history displays are bounded; large mapping administration needs pagination. Shopify product/price mutations have a read-to-write concurrency gap; inventory has API CAS. See the status and security documents before enabling writes.
 
-```powershell
-git checkout feat/syncpilot-foundation
-git pull origin feat/syncpilot-foundation
-powershell -ExecutionPolicy Bypass -File .\scripts\local-check.ps1
-```
+- [Implementation status](docs/IMPLEMENTATION_STATUS.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Application contracts](docs/API.md)
+- [Security and limits](docs/SECURITY.md)
+- [Operations runbook](docs/RUNBOOK.md)
+- [Project audit](docs/PROJECT_AUDIT.md)
+- [Decisions and open requirements](docs/DECISIONS.md)
+- [Shopify API contracts](docs/SHOPIFY_CONTRACTS.md)
 
-This runs `npm ci`, `prisma generate`, `prisma validate`, TypeScript type checking and the React Router production build. It creates `local-check-results/summary.txt` and step-specific stdout/stderr logs. The reports are gitignored.
-
-To include the database migration, start PostgreSQL and then run:
-
-```powershell
-docker compose up -d postgres
-powershell -ExecutionPolicy Bypass -File .\scripts\local-check.ps1 -SkipInstall -WithMigration
-```
-
-Share only `summary.txt` and sanitized failure logs. **Never share `.env`, Shopify tokens/secrets, database passwords, or raw customer data.** The script does not connect Shopify stores and it does not test actual synchronization. To test OAuth and the local tunnel, separately use `shopify app dev --store your-development-store.myshopify.com` in a development store.
-
-## Shopify installation across two stores
-
-Custom-distribution apps can be installed on multiple stores in the **same Shopify Plus organization** (or eligible development stores). Install the same app separately in Store A and Store B using your Shopify custom installation link. Each install produces its own authenticated session. This does not authorize cross-store data access by itself. Store pairing needs explicit approval by authorized staff on both installations and must verify organization/store ownership before enabling sync.
-
-If stores belong to different organizations, do not assume a single custom install link can connect both.
-
-## Safety controls
-
-- All writes are OFF in this branch.
-- All mutation actions must enforce workspace authorization and verified variant/location mapping.
-- Do not use SKU alone for mapping.
-- Shopify webhook HMAC is verified by the official library before recording delivery metadata.
-- Webhook delivery IDs are deduplicated in PostgreSQL.
-- `inventorySetQuantities` must use expected quantity (CAS) and the required idempotency key under Shopify 2026-10.
-- Reconciliation is required because webhooks can be repeated, delayed or lost.
-
-## Development status and next milestones
-
-See [docs/ROADMAP.md](docs/ROADMAP.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for phases, API architecture, safe pairing, worker queues and release gates.
-
-## Attribution
-
-The React Router app scaffolding is adapted from [Shopify's official app template](https://github.com/Shopify/shopify-app-template-react-router); refer to [LICENSE.md](LICENSE.md).
-
-## Review status
-
-Dependencies, type checking, database migration execution, Shopify OAuth, webhooks and live-store behavior **have not been executed or validated in this chat environment**. Run the listed setup and tests on a development machine before merging or deploying.
+Scaffolding is adapted from Shopify's official React Router template; see LICENSE.md.

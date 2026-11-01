@@ -35,6 +35,19 @@ model Workspace {
   createdAt   DateTime         @default(now())
   updatedAt   DateTime         @updatedAt
   connections ShopConnection[]
+  members WorkspaceMember[]
+  pairs StorePair[]
+  policies SyncPolicy[]
+  productMappings ProductMapping[]
+  variantMappings VariantMapping[]
+  locationMappings LocationMapping[]
+  previews SyncPreview[]
+  reconciliationRuns ReconciliationRun[]
+  notificationSettings NotificationSetting[]
+  conflicts SyncConflict[]
+  state       String           @default("ACTIVE")
+  retentionDays Int            @default(90)
+  reconciliationMinutes Int    @default(360)
 }
 
 model ShopConnection {
@@ -46,6 +59,12 @@ model ShopConnection {
   installedAt   DateTime   @default(now())
   lastSeenAt    DateTime   @default(now())
   uninstalledAt DateTime?
+  shopGid       String?
+  currency      String?
+  scopes        String?
+  verifiedAt    DateTime?
+  lastImportAt  DateTime?
+  lastError     String?
 
   @@index([workspaceId])
 }
@@ -60,6 +79,14 @@ model StorePairingRequest {
   expiresAt         DateTime
   verifiedAt        DateTime?
   createdAt         DateTime  @default(now())
+  challengeHash     String?
+  attempts          Int       @default(0)
+  initiatingActor   String?
+  destinationActor  String?
+  initiatingApprovedAt DateTime?
+  destinationApprovedAt DateTime?
+  organizationConfirmed Boolean @default(false)
+  workspaceId       String?
 
   @@index([initiatingShop, destinationShop])
 }
@@ -77,8 +104,18 @@ model SyncPolicy {
   enabled             Boolean  @default(false)
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
+  fields              String[] @default([])
+  buffer              Int      @default(0)
+  allowNegative       Boolean  @default(false)
+  inventoryMode       String   @default("DISABLED")
+  reconciliationMinutes Int    @default(360)
+  status              String   @default("DRAFT")
+  approvedBy          String?
+  approvedAt          DateTime?
 
   @@index([workspaceId])
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
 }
 
 model ProductMapping {
@@ -92,7 +129,10 @@ model ProductMapping {
   createdAt           DateTime @default(now())
 
   @@unique([sourceShopDomain, sourceProductGid, targetShopDomain], map: "ProductMapping_source_target_unique")
+  @@unique([targetShopDomain, targetProductGid, sourceShopDomain], map: "ProductMapping_target_source_unique")
   @@index([workspaceId])
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
 }
 
 model VariantMapping {
@@ -108,7 +148,10 @@ model VariantMapping {
   createdAt            DateTime @default(now())
 
   @@unique([sourceShopDomain, sourceVariantGid, targetShopDomain], map: "VariantMapping_source_target_unique")
+  @@unique([targetShopDomain, targetVariantGid, sourceShopDomain], map: "VariantMapping_target_source_unique")
   @@index([workspaceId])
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
 }
 
 model LocationMapping {
@@ -122,7 +165,10 @@ model LocationMapping {
   createdAt          DateTime @default(now())
 
   @@unique([sourceShopDomain, sourceLocationGid, targetShopDomain], map: "LocationMapping_source_target_unique")
+  @@unique([targetShopDomain, targetLocationGid, sourceShopDomain], map: "LocationMapping_target_source_unique")
   @@index([workspaceId])
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
 }
 
 model WebhookEvent {
@@ -134,6 +180,8 @@ model WebhookEvent {
   status      String   @default("RECEIVED")
   receivedAt  DateTime @default(now())
   processedAt DateTime?
+  attempts    Int       @default(0)
+  lastError   String?
 
   @@unique([shopDomain, deliveryId])
   @@index([shopDomain, receivedAt])
@@ -154,8 +202,18 @@ model SyncJob {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
   completedAt DateTime?
+  syncAttempts SyncAttempt[]
+  previewId   String?
+  payload     Json?
+  idempotencyKey String? @unique
+  availableAt DateTime  @default(now())
+  leaseUntil  DateTime?
+  leaseOwner  String?
+  maxAttempts Int       @default(5)
+  startedAt   DateTime?
 
   @@index([workspaceId, status, createdAt])
+  @@index([status, availableAt, leaseUntil])
 }
 
 model SyncConflict {
@@ -167,8 +225,197 @@ model SyncConflict {
   status      String    @default("OPEN")
   createdAt   DateTime  @default(now())
   resolvedAt  DateTime?
+  policyId    String?
+  resourceId  String?
+  field       String?
+  sourceValue Json?
+  targetValue Json?
+  resolution  String?
+  resolvedBy  String?
 
   @@index([workspaceId, status])
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+}
+
+model WorkspaceMember {
+  id          String   @id @default(cuid())
+  workspaceId String
+  shopDomain  String
+  userId      String
+  role        String   @default("VIEWER")
+  status      String   @default("ACTIVE")
+  createdAt   DateTime @default(now())
+
+  @@unique([workspaceId, shopDomain, userId])
+  @@index([workspaceId, status])
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+}
+
+model StorePair {
+  id          String   @id @default(cuid())
+  workspaceId String
+  sourceShop  String
+  targetShop  String
+  status      String   @default("VERIFIED")
+  requestId   String   @unique
+  verifiedAt  DateTime @default(now())
+  revokedAt   DateTime?
+
+  @@unique([workspaceId, sourceShop, targetShop])
+  @@index([workspaceId, status])
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+}
+
+model CatalogSnapshot {
+  id          String   @id @default(cuid())
+  shopDomain  String
+  status      String   @default("RUNNING")
+  cursor      String?
+  products    Int      @default(0)
+  variants    Int      @default(0)
+  locations   Int      @default(0)
+  lastError   String?
+  startedAt   DateTime @default(now())
+  completedAt DateTime?
+
+  @@index([shopDomain, startedAt])
+}
+
+model ProductSnapshot {
+  id               String   @id @default(cuid())
+  shopDomain       String
+  productGid       String
+  title            String
+  status           String
+  handle           String
+  descriptionHtml  String   @default("")
+  vendor           String   @default("")
+  productType      String   @default("")
+  tags             String[] @default([])
+  currency         String?
+  data             Json
+  hash             String
+  shopifyUpdatedAt DateTime?
+  observedAt       DateTime @default(now())
+
+  @@unique([shopDomain, productGid])
+  @@index([shopDomain, title])
+}
+
+model VariantSnapshot {
+  id               String   @id @default(cuid())
+  shopDomain       String
+  variantGid       String
+  productGid       String
+  inventoryItemGid String?
+  sku              String?
+  barcode          String?
+  price            String
+  compareAtPrice   String?
+  options          Json
+  tracked          Boolean  @default(false)
+  data             Json
+  hash             String
+  observedAt       DateTime @default(now())
+
+  @@unique([shopDomain, variantGid])
+  @@index([shopDomain, productGid])
+  @@index([shopDomain, sku])
+}
+
+model LocationSnapshot {
+  id          String   @id @default(cuid())
+  shopDomain  String
+  locationGid String
+  name        String
+  isActive    Boolean  @default(true)
+  observedAt  DateTime @default(now())
+
+  @@unique([shopDomain, locationGid])
+}
+
+model InventorySnapshot {
+  id               String   @id @default(cuid())
+  shopDomain       String
+  inventoryItemGid String
+  locationGid      String
+  quantity         Int
+  observedAt       DateTime @default(now())
+
+  @@unique([shopDomain, inventoryItemGid, locationGid])
+  @@index([shopDomain, locationGid])
+}
+
+model SyncPreview {
+  id          String   @id @default(cuid())
+  workspaceId String
+  policyId    String
+  createdBy   String
+  sourceHash  String
+  targetHash  String
+  changes     Json
+  status      String   @default("PENDING")
+  expiresAt   DateTime
+  approvedBy  String?
+  approvedAt  DateTime?
+  createdAt   DateTime @default(now())
+
+  @@index([workspaceId, status, createdAt])
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+}
+
+model SyncAttempt {
+  id          String    @id @default(cuid())
+  jobId       String
+  attempt     Int
+  status      String
+  errorCode   String?
+  details     Json?
+  startedAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  job SyncJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@unique([jobId, attempt])
+}
+
+model ReconciliationRun {
+  id          String   @id @default(cuid())
+  workspaceId String
+  policyId    String
+  status      String   @default("PENDING")
+  findings    Json?
+  total       Int      @default(0)
+  drifted     Int      @default(0)
+  startedAt   DateTime @default(now())
+  completedAt DateTime?
+  createdBy   String
+
+  @@index([workspaceId, startedAt])
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+}
+
+model WorkerHeartbeat {
+  id      String   @id
+  seenAt  DateTime @default(now())
+  status  String
+  details Json?
+}
+
+model NotificationSetting {
+  id          String   @id @default(cuid())
+  workspaceId String   @unique
+  enabled     Boolean  @default(true)
+  failureThreshold Int @default(3)
+  lagMinutes  Int      @default(15)
+  updatedAt   DateTime @updatedAt
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
 }
 
 model AuditEvent {

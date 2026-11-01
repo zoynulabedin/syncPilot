@@ -1,46 +1,28 @@
-# SyncPilot Architecture — Security-first Multi-store Sync
+# SyncPilot architecture
 
-## Deployment
-- React Router embedded UI -> authenticated server routes -> PostgreSQL/Prisma
-- Shopify per-store tokens managed through @shopify/shopify-app-session-storage-prisma
-- Planned: Redis/BullMQ jobs (separate web and worker process)
-- Planned: verified pairing, snapshot importer, mapping engine, reconciliation worker
+React Router loaders/actions authenticate through Shopify, derive owner/staff authority from an online session, and call scoped control-plane services. PostgreSQL stores pairing, memberships, snapshots, explicit GID mappings, policies, previews, jobs, attempts, conflicts, reconciliation and audit metadata. Shopify credentials stay in encrypted session storage and never enter loader data.
 
-## Ingest and processing
-1. Shopify webhook arrives on a route.
-2. Shopify library verifies HMAC with `authenticate.webhook(request)`.
-3. Store metadata with unique (shopDomain, deliveryId); reply quickly.
-4. Planned worker claims inbox event, finds enabled policy, checks tenant+pairing.
-5. Enqueue one job per authorized destination and mapped resource.
-6. Worker loads latest source and target states, validates mapping and field ownership.
-7. Apply mutation with Shopify API throttling, idempotency and CAS where appropriate.
-8. Record attempts and audit events; on stale state, hold a conflict.
-9. Periodic reconciliation compares snapshots to repair missed events.
+The independently runnable worker polls PostgreSQL durable jobs. PostgreSQL is the queue and outbox authority; there is no BullMQ dispatcher in this release. Redis is provisioned for future queue acceleration and is checked by readiness when configured. Losing Redis cannot lose PostgreSQL work; readiness may report the configured dependency unavailable.
 
-**Foundation currently stops at step 3.**
+## Data path
 
-## Security boundaries
-- Two installations do not imply two stores are authorized to share data.
-- Only verified workspace pairing can authorize cross-store operations.
-- Each Admin GraphQL request is sent with the token of its own installed store.
-- Tokens stay server side. Separate environment secrets and encryption at rest.
-- Scope cross-store lookups by workspaceId and check current shop membership.
-- No SKU-only variant association.
-- Destructive operations are disabled by default.
-- Uninstall revokes write operations, marks ShopConnection as UNINSTALLED.
+1. The Shopify library verifies a webhook HMAC.
+2. A unique shop/delivery receipt is persisted. The worker transactionally turns RECEIVED receipts into idempotent jobs and marks dispatch state.
+3. Imports paginate products, variants, locations and each inventory item's location levels. Checkpoints advance only after persistence. Completed imports remove observations not seen in that run.
+4. Active field policies and explicit mappings identify authorized comparisons. Events and scheduled reconciliation prepare findings and pending exact plans.
+5. An online verified owner activates a reviewed policy and separately approves an unexpired exact plan. A serializable transaction consumes it once and creates an APPLY_PREVIEW job.
+6. The worker claims a leased job with row/source locks. It checks the active pair, installations, owner membership proofs, policy, approval, mapping, write flags, source/target hashes and exact changes against live Shopify state.
+7. Resource locks serialize SyncPilot writers. Inventory uses expected target quantity and a stable Shopify idempotency key. Product and price writes target selected fields without productSet list replacement.
+8. Per-resource remote outcomes, job attempts and audit records are persisted. Unknown outcomes are held, not blindly replayed. Read work retries with bounded backoff and checkpoints.
 
-## Product vs inventory source of truth
-Product: field-by-field ownership (title/description/variants/price/status).
-Inventory: explicit quantity authority, not naive A <-> B mirroring.
-Multi-store shared stock cannot be safely managed with independent unconditional stock overwrites.
+## Revocation and concurrency
 
-## Operational controls
-- event delivery ID dedupe + job idempotency key
-- Retryable errors / dead-letter queue / bounded exponential backoff
-- Per-store GraphQL cost throttling
-- CAS on absolute inventory quantities; never opt out by default
-- Manual approvals for mapping conflicts, deletion and bulk changes
-- 6-hour or daily reconciliation (configurable), with dry-run mode
+Pause/disconnect/uninstall/scope changes revoke future work and approvals. Workers recheck consent after remote preflight and immediately before mutations. Requests already accepted by Shopify cannot be recalled. Product/price APIs do not provide inventory-style CAS, so concurrent third-party edits still have a narrow check-to-write gap. See SECURITY.md.
 
-## Remaining implementation
-Pairing endpoints, UI, multi-store scope verification, queue, workers, GraphQL writers, reconciliation, tests, deployment secrets and operational runbook.
+Inventory supports one authoritative source, mapped inventory items and locations, available quantity and a nonnegative safety buffer. Shared pools and two-way numerical mirroring are unsupported. Reverse product policies may own disjoint fields.
+
+## Operational boundaries
+
+Local Shopify CLI starts web and worker with the same injected app environment. Deployment uses separate web/worker processes and a one-time migration task. `/health` is liveness; `/ready` checks PostgreSQL and configured Redis and returns generic status. Neither proves Shopify release acceptance.
+
+Imports persist live observations incrementally; snapshots are not transactionally frozen full-catalog point-in-time images. Apply always rereads affected Shopify resources. Catalog import callers are owner-authorized; cross-store imports require an active pair. Large imported identities can be mapped via full GIDs even when suggestion/history displays are bounded.

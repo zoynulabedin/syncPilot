@@ -3,3 +3,8 @@ build
 public/build
 */*.yml
 .shopify
+syncPilot
+coverage
+playwright-report
+test-results
+.react-router

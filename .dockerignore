@@ -1,3 +1,15 @@
 .cache
 build
 node_modules
+.git
+.shopify
+.env
+.env.*
+!.env.example
+syncPilot
+local-check-results
+coverage
+test-results
+playwright-report
+backups
+*.log
