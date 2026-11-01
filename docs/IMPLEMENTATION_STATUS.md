@@ -11,7 +11,7 @@ Shopify writes remain disabled. Events and schedules generate reviewable proposa
 ## Executed verification
 
 - TypeScript, ESLint and production build: PASS.
-- Unit tests: 49 PASS (integration cases are skipped in the separate unit run).
+- Unit tests: 53 PASS (integration cases are skipped in the separate unit run).
 - Fresh disposable PostgreSQL integration: 30 PASS, including a 10,000-product fixture, real database concurrency/approval/tenant checks, simulated inventory CAS, uncertain outcomes, cancellation and lifecycle revocation.
 - Built-server HTTP smoke: 3 PASS. Liveness/readiness, invalid-token rejection and forged webhook rejection are checked using synthetic credentials; these are not authenticated browser tests.
 - Prisma validation/generation and both forward migrations: PASS locally; migrations from an empty database also pass in integration tests.
@@ -33,3 +33,5 @@ The full master specification is incomplete. Both-owner live acceptance on Quick
 Advanced creation/options/media/metafield/collection adapters, shared-pool allocation ledger, unattended mutation consent, external alert delivery, automatic retention/privacy operations, and full mapping-history pagination are not implemented. Product/price APIs also retain a documented read-to-write concurrency gap; inventory has API CAS.
 
 See RUNBOOK.md, PROJECT_AUDIT.md, API.md, SECURITY.md, SHOPIFY_CONTRACTS.md and DECISIONS.md. Do not label this production-ready or the whole specification complete.
+
+The live Quickstart owner dashboard, pairing controls and worker heartbeat were verified after reconnecting the browser. A real read-only import exposed legacy CLI HOST injection missing from the worker; the shared URL resolver now handles development HOST and classifies initialization errors. Four URL configuration regressions were added. Live import retry evidence is recorded separately after verification.

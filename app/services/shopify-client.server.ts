@@ -39,9 +39,17 @@ export async function offlineExecutor(
   )
     throw new SyncError("UNINSTALLED", "The shop installation is inactive.");
   // The official library refreshes expiring offline tokens and decrypts via the configured session adapter.
-  const { unauthenticated } = await import("../shopify.server");
+  let runtime: typeof import("../shopify.server");
   try {
-    const { admin } = await unauthenticated.admin(shop);
+    runtime = await import("../shopify.server");
+  } catch {
+    throw new SyncError(
+      "CONFIGURATION_ERROR",
+      "The worker could not initialize Shopify. Check its app URL, API credentials and session encryption key.",
+    );
+  }
+  try {
+    const { admin } = await runtime.unauthenticated.admin(shop);
     return (document, options) => admin.graphql(document, options);
   } catch {
     throw new SyncError(

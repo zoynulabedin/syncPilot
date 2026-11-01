@@ -41,3 +41,5 @@ Use a distinct Shopify staging app/configuration and HTTPS domain. Set productio
 Keep both write flags false. Complete two-real-development-store installation/owner/pairing/import/webhook tests, an explicitly approved small field pilot, inventory concurrent-sale/CAS tests and crash recovery. Configure ingress limits, encrypted backups, monitoring, alert delivery, support ownership and rollback. No staging/production deployment has been performed by this work.
 
 For emergency rollback first close write gates, pause policies and stop workers, preserve attempts/audit and inspect in-flight outcomes. Roll back application image only to a schema-compatible version; migrations are forward-only. Do not drop data or blindly restore over an application database.
+
+Older Shopify CLI versions supply HOST to child processes. The Shopify configuration resolves that validated development URL for both web and worker; production requires an explicit SHOPIFY_APP_URL. CONFIGURATION_ERROR indicates worker initialization settings, distinct from an expired store session.

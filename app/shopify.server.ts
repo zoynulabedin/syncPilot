@@ -6,13 +6,14 @@ import {
 } from "@shopify/shopify-app-react-router/server";
 import { EncryptedSessionStorage } from "./services/session-storage.server";
 import prisma from "./db.server";
+import { resolveShopifyAppUrl } from "./services/environment.server";
 
 const shopify = shopifyApp({
   apiKey: process.env.SHOPIFY_API_KEY,
   apiSecretKey: process.env.SHOPIFY_API_SECRET || "",
   apiVersion: ApiVersion.October26,
   scopes: process.env.SCOPES?.split(","),
-  appUrl: process.env.SHOPIFY_APP_URL || "",
+  appUrl: resolveShopifyAppUrl(),
   authPathPrefix: "/auth",
   sessionStorage: new EncryptedSessionStorage(prisma),
   useOnlineTokens: true,
