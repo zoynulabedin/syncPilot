@@ -29,7 +29,7 @@ SyncPilot is a **custom-distribution embedded Shopify app** for authorized Shopi
 1. Clone the repository and check out `feat/syncpilot-foundation`.
 2. Run `npm ci` (the committed `package-lock.json` ensures reproducible dependencies).
 3. Run `docker compose up -d postgres`.
-4. Copy `.env.example` to `.env` (PowerShell: `Copy-Item .env.example .env`).
+4. Copy `.env.example` to `.env` (macOS: `cp -n .env.example .env`; Windows PowerShell: `Copy-Item .env.example .env`).
 5. Use local database URL: `postgresql://syncpilot:syncpilot_dev_only@localhost:5432/syncpilot?schema=public`.
 6. Run `npx prisma generate` and `npx prisma migrate deploy`.
 7. Run `shopify app config link` and select the existing SyncPilot app in Shopify Dev Dashboard. If the correct app is already linked, check with `shopify app info` instead.
@@ -37,6 +37,34 @@ SyncPilot is a **custom-distribution embedded Shopify app** for authorized Shopi
 9. Verify `/app`, `/app/products`, `/app/inventory`, `/app/stores`, `/app/rules` and `/app/activity`. The example `application_url`/`redirect_urls` in `shopify.app.toml` are not a production configuration; replace them with the real hosted domain before production deployment. The tunnel URL is temporary and might not be written back to TOML.
 
 The sample Docker Compose database password is only for localhost development. For webhooks, use the default Cloudflare tunnel (do **not** use `--use-localhost`). `shopify app dev` requires a development store or Shopify Plus sandbox store, not a production customer store. Keep the terminal running while testing. Use a proper secret for staging/production. Never commit the real `.env`, tokens, or Shopify API secrets.
+
+## macOS setup (project on Desktop)
+
+If your local project folder is on your Mac Desktop:
+
+```bash
+cd ~/Desktop/syncPilot
+git checkout feat/syncpilot-foundation
+git pull origin feat/syncpilot-foundation
+cp -n .env.example .env
+```
+
+Edit `.env` locally with the development PostgreSQL URL. Then:
+
+```bash
+docker compose up -d postgres
+bash scripts/local-check.sh --with-migration
+```
+
+On a successful build, connect the existing Shopify app if necessary with `shopify app config link`, then use:
+
+```bash
+shopify app dev --store your-dev-store.myshopify.com
+```
+
+Shopify CLI runs a development tunnel for the selected development store. The script saves non-sensitive command reports to `local-check-results/`; sanitize logs before sharing them. Do not share your `.env`, API secret, Shopify tokens, or raw customer data.
+
+If the Desktop folder is synchronized with iCloud, open Terminal, enter `cd ` (with a trailing space), drag the project folder from Finder into Terminal, and press Return to use its exact path.
 
 ## Windows local validation and collaboration
 
