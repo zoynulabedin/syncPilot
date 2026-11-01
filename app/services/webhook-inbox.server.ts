@@ -14,15 +14,18 @@ export async function recordVerifiedWebhook(
       status: 400,
     });
   }
-  return prisma.webhookEvent.upsert({
-    where: { shopDomain_deliveryId: { shopDomain, deliveryId } },
-    create: {
+  // PostgreSQL INSERT ... ON CONFLICT avoids Prisma's emulated read/create upsert race.
+  await prisma.webhookEvent.createMany({
+    data: {
       shopDomain,
       deliveryId,
       topic,
       resourceId,
       status: "RECEIVED",
     },
-    update: {},
+    skipDuplicates: true,
+  });
+  return prisma.webhookEvent.findUniqueOrThrow({
+    where: { shopDomain_deliveryId: { shopDomain, deliveryId } },
   });
 }

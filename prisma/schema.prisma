@@ -48,6 +48,10 @@ model Workspace {
   state       String           @default("ACTIVE")
   retentionDays Int            @default(90)
   reconciliationMinutes Int    @default(360)
+  retentionEnabled Boolean @default(false)
+  lastRetentionAt DateTime?
+  operationalAlerts OperationalAlert[]
+  notificationDeliveries NotificationDelivery[]
 }
 
 model ShopConnection {
@@ -99,6 +103,7 @@ model SyncPolicy {
   direction           String   @default("ONE_WAY")
   syncProduct         Boolean  @default(false)
   syncPrices          Boolean  @default(false)
+  syncVariants        Boolean  @default(false)
   syncInventory       Boolean  @default(false)
   inventoryAuthority  String?
   enabled             Boolean  @default(false)
@@ -131,6 +136,7 @@ model ProductMapping {
   @@unique([sourceShopDomain, sourceProductGid, targetShopDomain], map: "ProductMapping_source_target_unique")
   @@unique([targetShopDomain, targetProductGid, sourceShopDomain], map: "ProductMapping_target_source_unique")
   @@index([workspaceId])
+  @@index([workspaceId, createdAt, id])
   workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
 
 }
@@ -150,6 +156,7 @@ model VariantMapping {
   @@unique([sourceShopDomain, sourceVariantGid, targetShopDomain], map: "VariantMapping_source_target_unique")
   @@unique([targetShopDomain, targetVariantGid, sourceShopDomain], map: "VariantMapping_target_source_unique")
   @@index([workspaceId])
+  @@index([workspaceId, createdAt, id])
   workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
 
 }
@@ -167,6 +174,7 @@ model LocationMapping {
   @@unique([sourceShopDomain, sourceLocationGid, targetShopDomain], map: "LocationMapping_source_target_unique")
   @@unique([targetShopDomain, targetLocationGid, sourceShopDomain], map: "LocationMapping_target_source_unique")
   @@index([workspaceId])
+  @@index([workspaceId, createdAt, id])
   workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
 
 }
@@ -214,6 +222,8 @@ model SyncJob {
 
   @@index([workspaceId, status, createdAt])
   @@index([status, availableAt, leaseUntil])
+  @@index([previewId])
+  @@index([eventId])
 }
 
 model SyncConflict {
@@ -234,6 +244,8 @@ model SyncConflict {
   resolvedBy  String?
 
   @@index([workspaceId, status])
+  @@index([workspaceId, createdAt, id])
+  @@index([jobId, status])
   workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
 
 }
@@ -413,6 +425,8 @@ model NotificationSetting {
   enabled     Boolean  @default(true)
   failureThreshold Int @default(3)
   lagMinutes  Int      @default(15)
+  externalEnabled Boolean @default(false)
+  lastEvaluatedAt DateTime?
   updatedAt   DateTime @updatedAt
   workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
 
@@ -429,5 +443,51 @@ model AuditEvent {
   details      Json?
   createdAt    DateTime @default(now())
 
+  @@index([workspaceId, createdAt])
+}
+
+// Only receipt metadata is stored; customer identities and raw webhook bodies are discarded.
+model PrivacyRequest {
+  id String @id @default(cuid())
+  deliveryKey String @unique
+  shopDomain String?
+  topic String
+  status String @default("PENDING")
+  outcome String?
+  receivedAt DateTime @default(now())
+  completedAt DateTime?
+
+  @@index([status, receivedAt])
+  @@index([shopDomain, receivedAt])
+}
+
+model OperationalAlert {
+  id String @id @default(cuid())
+  workspaceId String
+  kind String
+  active Boolean @default(false)
+  revision Int @default(0)
+  observedValue Int @default(0)
+  updatedAt DateTime @updatedAt
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  @@unique([workspaceId, kind])
+}
+
+model NotificationDelivery {
+  id String @id @default(cuid())
+  workspaceId String
+  dedupKey String @unique
+  payload Json
+  status String @default("PENDING")
+  attempts Int @default(0)
+  availableAt DateTime @default(now())
+  leaseUntil DateTime?
+  leaseOwner String?
+  errorCode String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deliveredAt DateTime?
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  @@index([status, availableAt, leaseUntil])
   @@index([workspaceId, createdAt])
 }

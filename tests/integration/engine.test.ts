@@ -381,10 +381,37 @@ function liveApi(
       };
     }
     if (doc.includes("SyncPilotProductUpdate")) {
-      const input = variables.product as { id: string; title: string };
+      const input = variables.product as {
+        id: string;
+        title?: string;
+        seo?: { title?: string; description?: string };
+      };
       const p = catalog.products.find((p) => p.id === input.id)!;
-      p.title = input.title;
+      if (input.title !== undefined) p.title = input.title;
+      if (input.seo)
+        p.seo = { title: null, description: null, ...p.seo, ...input.seo };
       return { productUpdate: { product: { id: p.id }, userErrors: [] } };
+    }
+    if (doc.includes("SyncPilotVariantUpdate")) {
+      const input = (
+        variables.variants as {
+          id: string;
+          inventoryItem?: { sku: string };
+          taxable?: boolean;
+          inventoryPolicy?: "DENY" | "CONTINUE";
+        }[]
+      )[0];
+      const v = catalog.variants.find((row) => row.id === input.id)!;
+      if (input.inventoryItem) v.sku = input.inventoryItem.sku;
+      if (input.taxable !== undefined) v.taxable = input.taxable;
+      if (input.inventoryPolicy !== undefined)
+        v.inventoryPolicy = input.inventoryPolicy;
+      return {
+        productVariantsBulkUpdate: {
+          productVariants: [{ id: v.id }],
+          userErrors: [],
+        },
+      };
     }
     if (doc.includes("SyncPilotInventorySet")) {
       const input = variables.input as {
@@ -451,16 +478,112 @@ integration("durable synchronization PostgreSQL worker", () => {
   afterAll(async () => {
     await prisma.$disconnect();
   });
+  it("applies selected SEO and variant fields through exact approvals without changing unrelated SEO or stock", async () => {
+    const f = await pairFixture();
+    f.source.products[0].seo = {
+      title: "Master SEO",
+      description: "Source description",
+    };
+    f.target.products[0].seo = {
+      title: "Old SEO",
+      description: "Keep destination description",
+    };
+    Object.assign(f.source.variants[0], {
+      sku: "MASTER-SKU",
+      taxable: false,
+      inventoryPolicy: "DENY",
+    });
+    Object.assign(f.target.variants[0], {
+      sku: "OLD-SKU",
+      taxable: true,
+      inventoryPolicy: "CONTINUE",
+    });
+    const policy = await prisma.syncPolicy.update({
+      where: { id: f.policy.id },
+      data: {
+        fields: ["seoTitle", "sku", "taxable", "inventoryPolicy"],
+        syncVariants: true,
+      },
+    });
+    for (const [shop, catalog] of [
+      [f.sourceShop, f.source],
+      [f.targetShop, f.target],
+    ] as const) {
+      await prisma.productSnapshot.update({
+        where: {
+          shopDomain_productGid: {
+            shopDomain: shop,
+            productGid: catalog.products[0].id,
+          },
+        },
+        data: { data: JSON.parse(JSON.stringify(catalog.products[0])) },
+      });
+      await prisma.variantSnapshot.update({
+        where: {
+          shopDomain_variantGid: {
+            shopDomain: shop,
+            variantGid: catalog.variants[0].id,
+          },
+        },
+        data: {
+          sku: catalog.variants[0].sku,
+          data: JSON.parse(JSON.stringify(catalog.variants[0])),
+        },
+      });
+    }
+    const plan = await buildPreview(policy.id);
+    await prisma.syncPreview.update({
+      where: { id: f.preview.id },
+      data: {
+        sourceHash: plan.sourceHash,
+        targetHash: plan.targetHash,
+        changes: plan.changes,
+      },
+    });
+    process.env.SYNC_WRITE_ENABLED = "true";
+    api.request.mockImplementation(liveApi(f));
+    expect((await runWorkerOnce("advanced-fields-worker")).status).toBe(
+      "SUCCEEDED",
+    );
+    expect(f.target.products[0].seo).toEqual({
+      title: "Master SEO",
+      description: "Keep destination description",
+    });
+    expect(f.target.variants[0]).toMatchObject({
+      sku: "MASTER-SKU",
+      taxable: false,
+      inventoryPolicy: "DENY",
+      inventoryItem: { tracked: true },
+    });
+    expect(f.target.inventory[0].quantity).toBe(3);
+    const writes = api.request.mock.calls.filter(
+      (call) => (call[3] as { write?: boolean })?.write,
+    );
+    expect(writes).toHaveLength(2);
+    expect(writes[1][2]).toMatchObject({
+      variants: [
+        {
+          id: f.target.variants[0].id,
+          inventoryItem: { sku: "MASTER-SKU" },
+          taxable: false,
+          inventoryPolicy: "DENY",
+        },
+      ],
+    });
+  });
   it("deduplicates delivery receipts and atomically dispatches one durable job", async () => {
     const shop = await ownShop();
     const request = new Request(
       "https://fixture.invalid/webhooks/products/update",
       { headers: { "X-Shopify-Webhook-Id": `delivery-${sequence}` } },
     );
-    const [one, two] = await Promise.all([
-      recordVerifiedWebhook(request, shop, "PRODUCTS_UPDATE", "100"),
-      recordVerifiedWebhook(request, shop, "PRODUCTS_UPDATE", "100"),
-    ]);
+    const [one, ...duplicates] = await Promise.all(
+      Array.from({ length: 12 }, () =>
+        recordVerifiedWebhook(request, shop, "PRODUCTS_UPDATE", "100"),
+      ),
+    );
+    const two = duplicates[0];
+    expect(new Set(duplicates.map((row) => row.id))).toEqual(new Set([one.id]));
     expect(one.id).toBe(two.id);
     await Promise.all([dispatchInbox(), dispatchInbox()]);
     expect(await prisma.syncJob.count({ where: { eventId: one.id } })).toBe(1);

@@ -41,6 +41,11 @@ const fieldLabels = {
   tags: "Tags",
   price: "Variant price",
   compareAtPrice: "Compare-at price",
+  seoTitle: "SEO title",
+  seoDescription: "SEO description",
+  sku: "Variant SKU",
+  taxable: "Variant tax status",
+  inventoryPolicy: "Allow selling out of stock (DENY / CONTINUE)",
 };
 
 export async function loader({ request }: LoaderFunctionArgs) {

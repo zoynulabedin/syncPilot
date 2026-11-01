@@ -8,6 +8,7 @@ import {
   mutationErrors,
   retryDelay,
   stableHash,
+  targetedFields,
   type CatalogRecords,
   type Mappings,
   type PolicyRecord,
@@ -101,6 +102,77 @@ function fixture() {
   return { source, target, maps, policy };
 }
 describe("sync plans and stock invariants", () => {
+  it("compares SEO fields without replacing the other SEO subfield", () => {
+    const f = fixture();
+    f.policy.fields = ["seoTitle"];
+    f.policy.syncPrices = false;
+    f.policy.syncInventory = false;
+    f.source.products[0].seo = {
+      title: "Source SEO",
+      description: "Source description",
+    };
+    f.target.products[0].seo = {
+      title: "Target SEO",
+      description: "Keep destination description",
+    };
+    const plan = buildSyncPreview(f.policy, f.maps, f.source, f.target);
+    expect(plan.changes).toHaveLength(1);
+    expect(targetedFields("PRODUCT", plan.changes)).toEqual({
+      seo: { title: "Source SEO" },
+    });
+  });
+  it("holds new fields when legacy snapshots have not observed them", () => {
+    const f = fixture();
+    f.policy.fields = ["seoTitle"];
+    f.policy.syncPrices = false;
+    f.policy.syncInventory = false;
+    expect(
+      buildSyncPreview(f.policy, f.maps, f.source, f.target).changes,
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "HOLD", code: "IMPORT_REQUIRED" }),
+      ]),
+    );
+  });
+  it("syncs selected variant fields independently of currency and never includes quantity/tracking inputs", () => {
+    const f = fixture();
+    Object.assign(f.policy, {
+      fields: ["sku", "taxable", "inventoryPolicy"],
+      syncProduct: false,
+      syncPrices: false,
+      syncVariants: true,
+      syncInventory: false,
+    });
+    f.target.currency = "EUR";
+    Object.assign(f.source.variants[0], {
+      sku: "MASTER-SKU",
+      taxable: false,
+      inventoryPolicy: "DENY",
+    });
+    Object.assign(f.target.variants[0], {
+      sku: "OLD-SKU",
+      taxable: true,
+      inventoryPolicy: "CONTINUE",
+    });
+    const plan = buildSyncPreview(f.policy, f.maps, f.source, f.target);
+    expect(plan.changes.map((change) => change.kind)).toEqual([
+      "VARIANT",
+      "VARIANT",
+      "VARIANT",
+    ]);
+    expect(targetedFields("VARIANT", plan.changes)).toEqual({
+      inventoryItem: { sku: "MASTER-SKU" },
+      taxable: false,
+      inventoryPolicy: "DENY",
+    });
+  });
+  it("rejects structural and unselected-field mutation construction", () => {
+    expect(() =>
+      targetedFields("PRODUCT", [
+        { kind: "PRODUCT", sourceId: "p1", field: "variants", after: [] },
+      ]),
+    ).toThrow("Unsupported targeted field");
+  });
   it("produces only explicitly selected fields and per-location inventory with expected quantity", () => {
     const f = fixture();
     const plan = buildSyncPreview(f.policy, f.maps, f.source, f.target);

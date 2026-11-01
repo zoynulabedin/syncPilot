@@ -35,3 +35,7 @@ uri = "/webhooks/products/update"
 [[webhooks.subscriptions]]
 topics = ["inventory_levels/update"]
 uri = "/webhooks/inventory/levels/update"
+
+[[webhooks.subscriptions]]
+compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
+uri = "/webhooks/privacy"

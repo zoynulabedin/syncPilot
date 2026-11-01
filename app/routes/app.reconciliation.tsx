@@ -7,6 +7,7 @@ import {
   useRevalidator,
 } from "react-router";
 import { authenticate } from "../shopify.server";
+import { Pagination } from "../components/list-navigation";
 import { requireActor } from "../services/authorization.server";
 import {
   getOperations,
@@ -34,7 +35,7 @@ import {
 export async function loader({ request }: LoaderFunctionArgs) {
   const actor = requireActor(await authenticate.admin(request));
   const [operations, { policies }] = await Promise.all([
-    getOperations(actor),
+    getOperations(actor, new URL(request.url).searchParams),
     getPolicies(actor),
   ]);
   return { ...operations, policies };
@@ -56,7 +57,7 @@ export async function action({ request }: ActionFunctionArgs) {
 }
 
 export default function Reconciliation() {
-  const { policies, reconciliations, canManage } =
+  const { policies, reconciliations, pages, canManage } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const revalidator = useRevalidator();
@@ -121,8 +122,8 @@ export default function Reconciliation() {
         )}
       </Section>
       <Section
-        title="Recent reconciliation runs"
-        description="The latest 20 runs, including incomplete work that can be diagnosed from its job."
+        title="Reconciliation history"
+        description="All runs, including incomplete work that can be diagnosed from its job."
       >
         {reconciliations.length ? (
           <Table
@@ -216,6 +217,7 @@ export default function Reconciliation() {
           </li>
         </ol>
       </Section>
+      <Pagination info={pages.runs} param="runsPage" label="runs" />
     </Page>
   );
 }

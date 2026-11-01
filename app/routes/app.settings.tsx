@@ -1,6 +1,8 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { Form, Link, useActionData, useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
+import { Pagination } from "../components/list-navigation";
+import { operationalCounts } from "../services/notifications.server";
 import { requireActor } from "../services/authorization.server";
 import {
   getMembers,
@@ -33,26 +35,22 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const actor = requireActor(await authenticate.admin(request));
   const [settings, operations, membership] = await Promise.all([
     getSettings(actor),
-    getOperations(actor),
+    getOperations(actor, new URL(request.url).searchParams),
     actor.role === "OWNER"
       ? getMembers(actor)
       : Promise.resolve({ members: [], connections: [] }),
   ]);
-  const failed = operations.jobs.filter((job) =>
-    ["FAILED", "DEAD_LETTER", "HELD"].includes(job.status),
-  ).length;
   const lagMinutes = settings.notification?.lagMinutes ?? 15;
-  const lagging = operations.jobs.filter(
-    (job) =>
-      ["PENDING", "RETRY"].includes(job.status) &&
-      Date.now() - new Date(job.availableAt).getTime() > lagMinutes * 60000,
-  ).length;
+  const alerts = settings.workspace
+    ? await operationalCounts(settings.workspace.id, lagMinutes)
+    : { failed: 0, held: 0, lagging: 0 };
   return {
     ...settings,
     ...membership,
     audit: operations.audit,
+    auditPage: operations.pages.audit,
     heartbeats: operations.heartbeats,
-    alerts: { failed, lagging },
+    alerts,
     observedNow: Date.now(),
   };
 }
@@ -65,8 +63,13 @@ export async function action({ request }: ActionFunctionArgs) {
       await updateSettings(actor, {
         name: textField(form, "name"),
         retentionDays: numberField(form, "retentionDays", 90),
+        retentionEnabled: checked(form, "retentionEnabled"),
         reconciliationMinutes: numberField(form, "reconciliationMinutes", 360),
         notificationsEnabled: checked(form, "notificationsEnabled"),
+        externalNotificationsEnabled: checked(
+          form,
+          "externalNotificationsEnabled",
+        ),
         failureThreshold: numberField(form, "failureThreshold", 3),
         lagMinutes: numberField(form, "lagMinutes", 15),
       });
@@ -96,6 +99,10 @@ export default function Settings() {
     members,
     connections,
     audit,
+    auditPage,
+    privacyRequests,
+    externalAlertsConfigured,
+    notificationDeliveries,
     heartbeats,
     alerts,
     observedNow,
@@ -156,8 +163,8 @@ export default function Settings() {
                 </Field>
                 <Field
                   name="retentionDays"
-                  label="History retention target (days)"
-                  hint="A retention policy target. Automated purge is not enabled; audit history is preserved."
+                  label="History retention (days)"
+                  hint="With cleanup enabled, eligible closed history and audit entries older than this are deleted. Open conflicts, failed or held jobs, and current catalog data are preserved."
                 >
                   <input
                     id="retentionDays"
@@ -213,6 +220,21 @@ export default function Settings() {
               </div>
               <label className="sp-checkbox">
                 <input
+                  name="retentionEnabled"
+                  type="checkbox"
+                  defaultChecked={workspace.retentionEnabled}
+                  disabled={!canManage}
+                />
+                Enable daily deletion of eligible history, including old audit
+                entries
+              </label>
+              <p className="sp-muted">
+                Deletion is permanent. Up to 500 entries per history type are
+                removed per daily cleanup; larger backlogs continue on later
+                days.
+              </p>
+              <label className="sp-checkbox">
+                <input
                   name="notificationsEnabled"
                   type="checkbox"
                   defaultChecked={notification?.enabled ?? true}
@@ -220,6 +242,21 @@ export default function Settings() {
                 />
                 Show operational alerts in SyncPilot
               </label>
+              <label className="sp-checkbox">
+                <input
+                  name="externalNotificationsEnabled"
+                  type="checkbox"
+                  defaultChecked={notification?.externalEnabled ?? false}
+                  disabled={!canManage || !externalAlertsConfigured}
+                />
+                Send alert counts and resolution notices to the
+                operator-configured webhook
+              </label>
+              <p className="sp-muted">
+                {externalAlertsConfigured
+                  ? "A destination is configured. Deliveries contain a workspace reference and job counts; product data and credentials are excluded."
+                  : "The deployment operator has not configured an external alert destination."}
+              </p>
               <div className="sp-actions">
                 <Submit intent="settings" disabled={!canManage}>
                   Save preferences
@@ -231,25 +268,33 @@ export default function Settings() {
             <Section title="Operational alerts">
               {alerts.failed >= (notification?.failureThreshold ?? 3) && (
                 <div role="alert" className="sp-notice sp-notice-error">
-                  {alerts.failed} recent jobs need attention.{" "}
+                  {alerts.failed} jobs need attention.{" "}
                   <Link to="/app/activity">Inspect failures</Link>
+                </div>
+              )}
+              {alerts.held > 0 && (
+                <div role="alert" className="sp-notice sp-notice-error">
+                  {alerts.held} held jobs require review before retrying or
+                  making further changes.
                 </div>
               )}
               {alerts.lagging > 0 && (
                 <div role="alert" className="sp-notice sp-notice-error">
-                  {alerts.lagging} recent jobs exceed the configured queue lag
+                  {alerts.lagging} jobs exceed the configured queue lag
                   threshold.
                 </div>
               )}
               {alerts.failed < (notification?.failureThreshold ?? 3) &&
-                alerts.lagging === 0 && (
+                alerts.lagging === 0 &&
+                alerts.held === 0 && (
                   <p className="sp-muted">
-                    No threshold alerts among the latest 50 jobs.
+                    No job thresholds are exceeded in this workspace.
                   </p>
                 )}
               <p className="sp-muted">
-                Alerts stay inside this app. External email and messaging
-                delivery is not configured.
+                External delivery requires the opt-in above. Each issue
+                generates an opening notice and a resolution notice; an
+                unchanged issue stays quiet.
               </p>
             </Section>
           )}
@@ -305,6 +350,35 @@ export default function Settings() {
           )}
         </>
       )}
+      <Section
+        title="External alert delivery"
+        description="Latest 10 delivery attempts. Retry and response details exclude endpoint credentials and response bodies."
+      >
+        {notificationDeliveries.length ? (
+          <Table
+            headings={["Delivery", "State", "Attempts", "Result", "Created"]}
+          >
+            {notificationDeliveries.map((delivery) => (
+              <tr key={delivery.id}>
+                <td className="sp-gid">{delivery.id}</td>
+                <td>
+                  <Status value={delivery.status} />
+                </td>
+                <td>{delivery.attempts}</td>
+                <td>
+                  {delivery.errorCode ||
+                    (delivery.deliveredAt ? "Delivered" : "Queued")}
+                </td>
+                <td>
+                  <Time value={delivery.createdAt} />
+                </td>
+              </tr>
+            ))}
+          </Table>
+        ) : (
+          <p className="sp-muted">No external deliveries have been queued.</p>
+        )}
+      </Section>
       <Section title="Worker signals">
         <Table headings={["Worker", "State", "Last signal"]}>
           {heartbeats.map((heartbeat) => (
@@ -331,8 +405,38 @@ export default function Settings() {
         )}
       </Section>
       <Section
+        title="Privacy requests"
+        description="Latest 25 receipts for this installation. SyncPilot does not store customer or order records. Store erasure requests are processed by the worker after uninstall."
+      >
+        {privacyRequests.length ? (
+          <Table headings={["Request", "State", "Outcome", "Received"]}>
+            {privacyRequests.map((request) => (
+              <tr key={request.id}>
+                <td>{request.topic.replaceAll("_", " ")}</td>
+                <td>
+                  <Status value={request.status} />
+                </td>
+                <td>
+                  {request.outcome?.replaceAll("_", " ") || "Awaiting worker"}
+                </td>
+                <td>
+                  <Time value={request.receivedAt} />
+                </td>
+              </tr>
+            ))}
+          </Table>
+        ) : (
+          <p className="sp-muted">No privacy requests for this installation.</p>
+        )}
+        <p>
+          <Link to="/privacy" target="_blank" rel="noreferrer">
+            Data handling and retention
+          </Link>
+        </p>
+      </Section>
+      <Section
         title="Audit trail"
-        description="Latest 50 authorized workspace decisions. Credentials and webhook payloads are excluded."
+        description="Authorized workspace decisions. Credentials and webhook payloads are excluded."
       >
         {audit.length ? (
           <Table headings={["Action", "Actor", "Resource", "When"]}>
@@ -353,6 +457,7 @@ export default function Settings() {
         ) : (
           <p className="sp-muted">No audit entries yet.</p>
         )}
+        <Pagination info={auditPage} param="auditPage" label="audit events" />
       </Section>
     </Page>
   );

@@ -1,4 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { PRODUCT_FIELDS, VARIANT_FIELDS } from "./sync";
+export { PRODUCT_FIELDS, VARIANT_FIELDS } from "./sync";
 
 export class DomainError extends Error {
   constructor(
@@ -11,17 +13,12 @@ export class DomainError extends Error {
   }
 }
 
-export const PRODUCT_FIELDS = [
-  "title",
-  "descriptionHtml",
-  "vendor",
-  "productType",
-  "status",
-  "handle",
-  "tags",
-] as const;
 export const PRICE_FIELDS = ["price", "compareAtPrice"] as const;
-export const SYNC_FIELDS = [...PRODUCT_FIELDS, ...PRICE_FIELDS] as const;
+export const SYNC_FIELDS = [
+  ...PRODUCT_FIELDS,
+  ...PRICE_FIELDS,
+  ...VARIANT_FIELDS,
+] as const;
 export function normalizeShop(value: unknown) {
   if (typeof value !== "string")
     throw new DomainError(
@@ -100,7 +97,7 @@ export function assertSafePreview(changes: unknown) {
       (change) =>
         typeof change !== "object" ||
         change === null ||
-        !["PRODUCT", "PRICE", "INVENTORY"].includes(change.kind),
+        !["PRODUCT", "PRICE", "VARIANT", "INVENTORY"].includes(change.kind),
     )
   ) {
     throw new DomainError(

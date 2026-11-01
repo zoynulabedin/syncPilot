@@ -8,7 +8,10 @@ export const PRODUCT_FIELDS = [
   "handle",
   "tags",
   "status",
+  "seoTitle",
+  "seoDescription",
 ] as const;
+export const VARIANT_FIELDS = ["sku", "taxable", "inventoryPolicy"] as const;
 export type ProductField = (typeof PRODUCT_FIELDS)[number];
 export type Json =
   null | boolean | number | string | Json[] | { [key: string]: Json };
@@ -22,6 +25,7 @@ export type ProductRecord = {
   productType: string;
   tags: string[];
   updatedAt?: string;
+  seo?: { title: string | null; description: string | null };
 };
 export type VariantRecord = {
   id: string;
@@ -32,6 +36,8 @@ export type VariantRecord = {
   compareAtPrice: string | null;
   selectedOptions: { name: string; value: string }[];
   inventoryItem: { id: string; tracked: boolean } | null;
+  taxable?: boolean;
+  inventoryPolicy?: "DENY" | "CONTINUE";
 };
 export type LocationRecord = { id: string; name: string; isActive: boolean };
 export type LevelRecord = {
@@ -50,6 +56,7 @@ export type PolicyRecord = {
   fields: string[];
   syncProduct: boolean;
   syncPrices: boolean;
+  syncVariants?: boolean;
   syncInventory: boolean;
   sourceShopDomain: string;
   targetShopDomain: string;
@@ -79,7 +86,7 @@ export type Mappings = {
   }[];
 };
 export type SyncChange = {
-  kind: "PRODUCT" | "PRICE" | "INVENTORY" | "HOLD";
+  kind: "PRODUCT" | "PRICE" | "VARIANT" | "INVENTORY" | "HOLD";
   sourceId: string;
   targetId?: string;
   field?: string;
@@ -124,6 +131,48 @@ export function stableHash(value: unknown) {
 }
 export function sameValue(left: unknown, right: unknown) {
   return stableHash(left ?? null) === stableHash(right ?? null);
+}
+export function selectedValue(
+  record: ProductRecord | VariantRecord,
+  field: string,
+): Json | undefined {
+  if (field === "seoTitle" || field === "seoDescription") {
+    const seo = (record as ProductRecord).seo;
+    return seo
+      ? (seo[field === "seoTitle" ? "title" : "description"] ?? "")
+      : undefined;
+  }
+  if (field === "sku") return (record as VariantRecord).sku ?? "";
+  const value = (record as unknown as Record<string, Json | undefined>)[field];
+  if (field === "price" || field === "compareAtPrice")
+    return money(value as string | null);
+  return field === "tags" && Array.isArray(value) ? [...value].sort() : value;
+}
+
+/** Only selected fields are sent; omitted SEO subfields and inventory-item fields stay untouched. */
+export function targetedFields(
+  kind: "PRODUCT" | "PRICE" | "VARIANT",
+  changes: SyncChange[],
+) {
+  const fields: Record<string, Json> = {};
+  for (const change of changes) {
+    const field = change.field || "";
+    const allowed: readonly string[] =
+      kind === "PRODUCT"
+        ? PRODUCT_FIELDS
+        : kind === "PRICE"
+          ? ["price", "compareAtPrice"]
+          : VARIANT_FIELDS;
+    if (!allowed.includes(field) || change.after === undefined)
+      throw new SyncError("INVALID_INPUT", "Unsupported targeted field.");
+    if (field === "seoTitle" || field === "seoDescription") {
+      const seo = (fields.seo || {}) as Record<string, Json>;
+      seo[field === "seoTitle" ? "title" : "description"] = change.after;
+      fields.seo = seo;
+    } else if (field === "sku") fields.inventoryItem = { sku: change.after };
+    else fields[field] = change.after;
+  }
+  return fields;
 }
 export function money(value: string | null): string | null {
   if (value === null) return null;
@@ -243,11 +292,17 @@ export function buildSyncPreview(
       "CONFLICTING_OWNERSHIP",
       "Each policy must have one authoritative direction. Use separate policies with disjoint field ownership.",
     );
-  if (!policy.syncProduct && !policy.syncPrices && !policy.syncInventory)
+  if (
+    !policy.syncProduct &&
+    !policy.syncPrices &&
+    !policy.syncVariants &&
+    !policy.syncInventory
+  )
     hold("EMPTY_POLICY", "Select at least one supported field group.");
   for (const field of policy.fields)
     if (
       !PRODUCT_FIELDS.includes(field as ProductField) &&
+      !(VARIANT_FIELDS as readonly string[]).includes(field) &&
       !["price", "compareAtPrice"].includes(field)
     )
       hold(
@@ -259,7 +314,10 @@ export function buildSyncPreview(
       "MAPPING_MISSING",
       "Verify a product mapping before comparing product fields.",
     );
-  if ((policy.syncPrices || policy.syncInventory) && !maps.variants.length)
+  if (
+    (policy.syncPrices || policy.syncVariants || policy.syncInventory) &&
+    !maps.variants.length
+  )
     hold(
       "MAPPING_MISSING",
       "Verify a variant mapping before comparing prices or stock.",
@@ -305,8 +363,17 @@ export function buildSyncPreview(
     const sf: Record<string, Json> = { id: from.id },
       tf: Record<string, Json> = { id: to.id };
     for (const field of selected) {
-      const left = field === "tags" ? [...from.tags].sort() : from[field];
-      const right = field === "tags" ? [...to.tags].sort() : to[field];
+      const left = selectedValue(from, field),
+        right = selectedValue(to, field);
+      if (left === undefined || right === undefined) {
+        hold(
+          "IMPORT_REQUIRED",
+          "Import both catalogs again to observe the selected field.",
+          from.id,
+          to.id,
+        );
+        continue;
+      }
       sf[field] = left;
       tf[field] = right;
       if (!sameValue(left, right))
@@ -349,7 +416,8 @@ export function buildSyncPreview(
   for (const map of [...maps.variants].sort((a, b) =>
     a.sourceVariantGid.localeCompare(b.sourceVariantGid),
   )) {
-    if (!policy.syncPrices && !policy.syncInventory) continue;
+    if (!policy.syncPrices && !policy.syncVariants && !policy.syncInventory)
+      continue;
     const from = source.variants.find((v) => v.id === map.sourceVariantGid),
       to = target.variants.find((v) => v.id === map.targetVariantGid);
     if (!map.verifiedAt || !from || !to) {
@@ -425,6 +493,38 @@ export function buildSyncPreview(
           });
       }
     }
+    if (policy.syncVariants)
+      for (const field of VARIANT_FIELDS) {
+        if (!policy.fields.includes(field)) continue;
+        const left = selectedValue(from, field),
+          right = selectedValue(to, field);
+        if (
+          left === undefined ||
+          right === undefined ||
+          (field === "sku" && (!from.inventoryItem || !to.inventoryItem))
+        ) {
+          hold(
+            "IMPORT_REQUIRED",
+            "Import both catalogs again to observe the selected variant field and inventory identity.",
+            from.id,
+            to.id,
+          );
+          continue;
+        }
+        sf[field] = left;
+        tf[field] = right;
+        if (!sameValue(left, right))
+          changes.push({
+            kind: "VARIANT",
+            sourceId: from.id,
+            targetId: to.id,
+            sourceProductId: from.product.id,
+            targetProductId: to.product.id,
+            field,
+            before: right,
+            after: left,
+          });
+      }
     if (policy.syncInventory) {
       sf.inventoryItemId = from.inventoryItem?.id ?? null;
       tf.inventoryItemId = to.inventoryItem?.id ?? null;

@@ -34,6 +34,12 @@ export const productSchema = z.object({
   productType: z.string(),
   tags: z.array(z.string()),
   updatedAt: z.string(),
+  seo: z
+    .object({
+      title: z.string().nullable(),
+      description: z.string().nullable(),
+    })
+    .optional(),
 });
 export const variantSchema = z.object({
   id: z.string(),
@@ -41,6 +47,8 @@ export const variantSchema = z.object({
   barcode: z.string().nullable(),
   price: z.string(),
   compareAtPrice: z.string().nullable(),
+  taxable: z.boolean().optional(),
+  inventoryPolicy: z.enum(["DENY", "CONTINUE"]).optional(),
   selectedOptions: z.array(z.object({ name: z.string(), value: z.string() })),
   product: z.object({ id: z.string() }),
   inventoryItem: z.object({ id: z.string(), tracked: z.boolean() }).nullable(),

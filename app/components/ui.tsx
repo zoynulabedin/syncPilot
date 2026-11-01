@@ -109,6 +109,7 @@ export function Status({ value }: { value: string }) {
     "ACTIVE",
     "APPROVED",
     "RESOLVED",
+    "DELIVERED",
   ].includes(normalized)
     ? "success"
     : [
@@ -118,6 +119,7 @@ export function Status({ value }: { value: string }) {
           "UNINSTALLED",
           "REJECTED",
           "CONFLICT",
+          "HELD",
         ].includes(normalized)
       ? "critical"
       : [

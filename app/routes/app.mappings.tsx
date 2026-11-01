@@ -1,6 +1,7 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { Form, Link, useActionData, useLoaderData } from "react-router";
 import { useState } from "react";
+import { Pagination, QueryFields } from "../components/list-navigation";
 import { authenticate } from "../shopify.server";
 import { requireActor } from "../services/authorization.server";
 import {
@@ -31,12 +32,9 @@ import {
 export async function loader({ request }: LoaderFunctionArgs) {
   const result = await getMappings(
     requireActor(await authenticate.admin(request)),
+    new URL(request.url).searchParams,
   );
-  const kind =
-    new URL(request.url).searchParams.get("kind") === "LOCATION"
-      ? "LOCATION"
-      : "PRODUCT";
-  return { ...result, kind };
+  return result;
 }
 
 export async function action({ request }: ActionFunctionArgs) {
@@ -77,7 +75,12 @@ export async function action({ request }: ActionFunctionArgs) {
   }
 }
 
-export default function Mappings() {
+export default function MappingsPage() {
+  const { kind } = useLoaderData<typeof loader>();
+  return <Mappings key={kind} />;
+}
+
+function Mappings() {
   const {
     products,
     variants,
@@ -85,10 +88,13 @@ export default function Mappings() {
     snapshots,
     connections,
     canManage,
-    kind: initialKind,
+    kind,
+    q,
+    resourceQ,
+    mappingPage,
+    resourcePage,
   } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
-  const [kind, setKind] = useState<string>(initialKind);
   const [sourceShop, setSourceShop] = useState(
     connections[0]?.shopDomain || "",
   );
@@ -97,7 +103,6 @@ export default function Mappings() {
   );
   const [sourceGid, setSourceGid] = useState("");
   const [targetGid, setTargetGid] = useState("");
-  const [query, setQuery] = useState("");
   const resources =
     kind === "PRODUCT"
       ? snapshots.products.map((item) => ({
@@ -159,14 +164,7 @@ export default function Mappings() {
       targetGid: item.targetLocationGid,
       verifiedAt: item.verifiedAt,
     })),
-  ].filter(
-    (item) =>
-      item.kind === kind &&
-      (!query ||
-        `${item.sourceGid} ${item.targetGid} ${item.sourceShop} ${item.targetShop}`
-          .toLowerCase()
-          .includes(query.toLowerCase())),
-  );
+  ];
   return (
     <Page
       title="Product, variant & location mappings"
@@ -179,6 +177,48 @@ export default function Mappings() {
     >
       <Notice data={actionData} />
       <ReadOnly canManage={canManage} />
+      <Section title="Find imported resources and mappings">
+        <Form method="get" className="sp-search">
+          <QueryFields
+            exclude={["kind", "q", "resourceQ", "mappingPage", "resourcePage"]}
+          />
+          <Field name="kind" label="Resource type">
+            <select id="kind" name="kind" defaultValue={kind}>
+              <option value="PRODUCT">Products</option>
+              <option value="VARIANT">Variants</option>
+              <option value="LOCATION">Locations</option>
+            </select>
+          </Field>
+          <Field name="resourceQ" label="Find imported resources">
+            <input
+              type="search"
+              id="resourceQ"
+              name="resourceQ"
+              defaultValue={resourceQ}
+              maxLength={120}
+              placeholder="Title, SKU, barcode or full GID"
+            />
+          </Field>
+          <Field name="q" label="Find verified mappings">
+            <input
+              type="search"
+              id="q"
+              name="q"
+              defaultValue={q}
+              maxLength={120}
+              placeholder="GID or store"
+            />
+          </Field>
+          <button type="submit" className="sp-button sp-button-secondary">
+            Search
+          </button>
+        </Form>
+        <Pagination
+          info={resourcePage}
+          param="resourcePage"
+          label="imported resources"
+        />
+      </Section>
       {connections.length < 2 ? (
         <Section title="Pair stores first">
           <EmptyState
@@ -195,25 +235,9 @@ export default function Mappings() {
           title="Verify a resource pair"
           description="Map products first, their variants second, and locations before inventory. A matching SKU is a clue, not proof of identity."
         >
-          <Form method="post">
+          <Form method="post" key={kind}>
+            <input type="hidden" name="kind" value={kind} />
             <div className="sp-form-grid">
-              <Field name="kind" label="Mapping type">
-                <select
-                  id="kind"
-                  name="kind"
-                  value={kind}
-                  onChange={(event) => {
-                    setKind(event.currentTarget.value);
-                    setSourceGid("");
-                    setTargetGid("");
-                  }}
-                >
-                  <option value="PRODUCT">Product</option>
-                  <option value="VARIANT">Variant</option>
-                  <option value="LOCATION">Location</option>
-                </select>
-              </Field>
-              <div />
               <Field name="sourceShop" label="Source store">
                 <select
                   id="sourceShop"
@@ -353,8 +377,8 @@ export default function Mappings() {
               </div>
             )}
             <p className="sp-muted">
-              Suggestions are limited to keep the page responsive. A full
-              imported GID works even when it is outside the suggestion list.
+              Suggestions use the resource search and page above. Search the
+              full catalog or enter a full imported GID.
             </p>
             <label className="sp-checkbox">
               <input
@@ -387,32 +411,6 @@ export default function Mappings() {
         title="Verified mappings"
         description="Identity is stored with Shopify GIDs. Removing a mapping prevents subsequent writes that depend on it."
       >
-        <div className="sp-search">
-          <Field name="mappingType" label="Resource type">
-            <select
-              id="mappingType"
-              value={kind}
-              onChange={(event) => {
-                setKind(event.currentTarget.value);
-                setSourceGid("");
-                setTargetGid("");
-              }}
-            >
-              <option value="PRODUCT">Products ({products.length})</option>
-              <option value="VARIANT">Variants ({variants.length})</option>
-              <option value="LOCATION">Locations ({locations.length})</option>
-            </select>
-          </Field>
-          <Field name="mappingQuery" label="Filter by ID or store">
-            <input
-              id="mappingQuery"
-              type="search"
-              value={query}
-              onChange={(event) => setQuery(event.currentTarget.value)}
-              placeholder="Search mappings"
-            />
-          </Field>
-        </div>
         {mappings.length ? (
           <Table
             headings={[
@@ -482,6 +480,7 @@ export default function Mappings() {
             pair. Ambiguous items should remain unmapped.
           </EmptyState>
         )}
+        <Pagination info={mappingPage} param="mappingPage" label="mappings" />
       </Section>
     </Page>
   );

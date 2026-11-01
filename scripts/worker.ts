@@ -1,6 +1,13 @@
 import { randomUUID } from "node:crypto";
+import { createWorkerCycle } from "./lib/worker-cycle";
 import prisma from "../app/db.server";
 import { logger } from "../app/services/logger.server";
+import { cleanHistory } from "../app/services/retention.server";
+import { processPrivacyRequests } from "../app/services/privacy.server";
+import {
+  scheduleNotifications,
+  deliverNotification,
+} from "../app/services/notifications.server";
 import {
   runWorkerOnce,
   scheduleReconciliations,
@@ -16,7 +23,22 @@ process.on("SIGTERM", () => {
 });
 const pause = (ms: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
-let lastScheduled = 0;
+const runCycle = createWorkerCycle({
+  maintenance: [
+    { stage: "RECONCILIATION", run: scheduleReconciliations },
+    { stage: "PRIVACY", run: processPrivacyRequests },
+    { stage: "RETENTION", run: cleanHistory },
+    { stage: "ALERT_SCHEDULING", run: scheduleNotifications },
+  ],
+  runJob: () => runWorkerOnce(workerId),
+  deliverAlert: deliverNotification,
+  onMaintenanceFailure: (stage) => {
+    logger.error(
+      { workerId, code: "WORKER_MAINTENANCE_FAILURE", stage },
+      "Worker maintenance failed; job processing will continue",
+    );
+  },
+});
 logger.info(
   {
     workerId,
@@ -28,11 +50,7 @@ logger.info(
 try {
   while (!stopping) {
     try {
-      if (Date.now() - lastScheduled > 60_000) {
-        await scheduleReconciliations();
-        lastScheduled = Date.now();
-      }
-      const result = await runWorkerOnce(workerId);
+      const result = await runCycle();
       if (!result.processed) await pause(1000);
     } catch {
       logger.error(

@@ -7,12 +7,11 @@ import {
   useRevalidator,
 } from "react-router";
 import { authenticate } from "../shopify.server";
-import db from "../db.server";
+import { Pagination, QueryFields } from "../components/list-navigation";
 import { requireActor } from "../services/authorization.server";
 import {
   cancelJob,
   getOperations,
-  getWorkspace,
   retryJob,
 } from "../services/control-plane.server";
 import {
@@ -36,35 +35,10 @@ import {
 
 export async function loader({ request }: LoaderFunctionArgs) {
   const actor = requireActor(await authenticate.admin(request));
-  const [operations, workspace] = await Promise.all([
-    getOperations(actor),
-    getWorkspace(actor),
-  ]);
-  const shops = [
-    ...new Set([
-      actor.shop,
-      ...workspace.connections.map((connection) => connection.shopDomain),
-    ]),
-  ];
-  const events = await db.webhookEvent.findMany({
-    where: { shopDomain: { in: shops } },
-    orderBy: { receivedAt: "desc" },
-    take: 50,
-    select: {
-      id: true,
-      shopDomain: true,
-      topic: true,
-      resourceId: true,
-      status: true,
-      receivedAt: true,
-      processedAt: true,
-      lastError: true,
-    },
-  });
   const url = new URL(request.url);
+  const operations = await getOperations(actor, url.searchParams);
   return {
     ...operations,
-    events,
     filter: url.searchParams.get("status") || "",
     selectedJob: url.searchParams.get("job") || "",
   };
@@ -90,11 +64,10 @@ export async function action({ request }: ActionFunctionArgs) {
 }
 
 export default function Activity() {
-  const { jobs, events, canManage, filter, selectedJob } =
+  const { jobs, events, pages, canManage, filter, selectedJob } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const revalidator = useRevalidator();
-  const visibleJobs = jobs.filter((job) => !filter || job.status === filter);
   return (
     <Page
       title="Sync jobs & activity"
@@ -112,10 +85,19 @@ export default function Activity() {
       <Notice data={actionData} />
       <ReadOnly canManage={canManage} />
       <Section
-        title="Recent jobs"
-        description="The latest 50 jobs in this workspace. A received webhook and a completed Shopify write are separate events."
+        title="Job history"
+        description="Search all authorized jobs. A received webhook and a completed Shopify write are separate events."
       >
         <Form method="get" className="sp-search">
+          <QueryFields exclude={["status", "job", "jobsPage"]} />
+          <Field name="job" label="Job ID">
+            <input
+              id="job"
+              name="job"
+              defaultValue={selectedJob}
+              maxLength={100}
+            />
+          </Field>
           <Field name="status" label="Filter job state">
             <select id="status" name="status" defaultValue={filter}>
               <option value="">All states</option>
@@ -140,7 +122,7 @@ export default function Activity() {
             Apply filter
           </button>
         </Form>
-        {visibleJobs.length ? (
+        {jobs.length ? (
           <Table
             headings={[
               "Job / operation",
@@ -151,7 +133,7 @@ export default function Activity() {
               "Actions",
             ]}
           >
-            {visibleJobs.map((job) => (
+            {jobs.map((job) => (
               <tr key={job.id}>
                 <td>
                   <strong>{job.operation.replaceAll("_", " ")}</strong>
@@ -270,10 +252,11 @@ export default function Activity() {
             background work.
           </EmptyState>
         )}
+        <Pagination info={pages.jobs} param="jobsPage" label="jobs" />
       </Section>
       <Section
         title="Verified webhook inbox"
-        description="The latest 50 deliveries from authorized stores. RECEIVED means durably stored; it does not mean the catalog or inventory was changed."
+        description="Deliveries from authorized stores. RECEIVED means durably stored; it does not mean the catalog or inventory was changed."
       >
         {events.length ? (
           <Table
@@ -315,6 +298,11 @@ export default function Activity() {
             they arrive.
           </EmptyState>
         )}
+        <Pagination
+          info={pages.events}
+          param="eventsPage"
+          label="webhook deliveries"
+        />
       </Section>
     </Page>
   );

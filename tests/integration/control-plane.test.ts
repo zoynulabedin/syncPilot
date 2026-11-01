@@ -274,6 +274,119 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         updatePolicy(a, policy.id, "ACTIVATE"),
       ).rejects.toMatchObject({ code: "PREVIEW_REQUIRED" });
     });
+    it("paginates every mapping with stable ties and searches resources beyond the first page without tenant leaks", async () => {
+      const { a, b, c, workspaceId } = await fixture();
+      const createdAt = new Date("2026-01-01T00:00:00Z");
+      await prisma.productMapping.createMany({
+        data: Array.from({ length: 61 }, (_, n) => ({
+          id: `${workspaceId}-mapping-${String(n).padStart(3, "0")}`,
+          workspaceId,
+          sourceShopDomain: a.shop,
+          targetShopDomain: b.shop,
+          sourceProductGid: `gid://shopify/Product/${1000 + n}`,
+          targetProductGid: `gid://shopify/Product/${2000 + n}`,
+          createdAt,
+        })),
+      });
+      await prisma.productSnapshot.createMany({
+        data: Array.from({ length: 61 }, (_, n) => ({
+          shopDomain: a.shop,
+          productGid: `gid://shopify/Product/${1000 + n}`,
+          title: `Resource ${String(n).padStart(3, "0")}`,
+          handle: `resource-${n}`,
+          status: "ACTIVE",
+          data: {},
+          hash: "test",
+        })),
+      });
+      const found = [];
+      for (let page = 1; page <= 3; page++) {
+        const result = await getMappings(
+          a,
+          new URLSearchParams({ mappingPage: String(page) }),
+        );
+        expect(result.mappingPage.total).toBe(61);
+        expect(result.products.length).toBeLessThanOrEqual(25);
+        found.push(...result.products.map((row) => row.id));
+      }
+      expect(new Set(found).size).toBe(61);
+      expect(found).toHaveLength(61);
+      const result = await getMappings(
+        a,
+        new URLSearchParams({
+          q: "2060",
+          resourceQ: "Resource 060",
+          mappingPage: "999999",
+        }),
+      );
+      expect(result.products).toHaveLength(1);
+      expect(result.mappingPage.page).toBe(1);
+      expect(result.snapshots.products[0].productGid).toBe(
+        "gid://shopify/Product/1060",
+      );
+      expect(
+        (await getMappings(c, new URLSearchParams({ resourceQ: "Resource" })))
+          .snapshots.products,
+      ).toEqual([]);
+    });
+    it("filters all job history before pagination and scopes old job links, audits and webhook pages", async () => {
+      const { a, b, c, workspaceId } = await fixture();
+      const createdAt = new Date("2026-01-01T00:00:00Z");
+      await prisma.syncJob.createMany({
+        data: Array.from({ length: 61 }, (_, n) => ({
+          id: `${workspaceId}-job-${String(n).padStart(3, "0")}`,
+          workspaceId,
+          policyId: "",
+          sourceShop: a.shop,
+          targetShop: b.shop,
+          operation: "RECONCILE",
+          status: n === 0 ? "FAILED" : "COMPLETED",
+          createdAt,
+        })),
+      });
+      await prisma.webhookEvent.createMany({
+        data: Array.from({ length: 61 }, (_, n) => ({
+          shopDomain: b.shop,
+          deliveryId: `listing-${n}`,
+          topic: "PRODUCTS_UPDATE",
+          receivedAt: createdAt,
+        })),
+      });
+      const first = await getOperations(a);
+      const second = await getOperations(
+        a,
+        new URLSearchParams({ jobsPage: "2", eventsPage: "2" }),
+      );
+      expect(first.pages.jobs.total).toBe(61);
+      expect(second.jobs).toHaveLength(25);
+      expect(
+        second.jobs.some((job) =>
+          first.jobs.some((item) => item.id === job.id),
+        ),
+      ).toBe(false);
+      expect(
+        second.events.some((event) =>
+          first.events.some((item) => item.id === event.id),
+        ),
+      ).toBe(false);
+      const filtered = await getOperations(
+        a,
+        new URLSearchParams({ status: "FAILED" }),
+      );
+      expect(filtered.pages.jobs.total).toBe(1);
+      const oldId = `${workspaceId}-job-000`;
+      expect(
+        (await getOperations(a, new URLSearchParams({ job: oldId }))).jobs[0]
+          .id,
+      ).toBe(oldId);
+      const other = await getOperations(
+        c,
+        new URLSearchParams({ job: oldId, eventsPage: "2", auditPage: "2" }),
+      );
+      expect(other.jobs).toEqual([]);
+      expect(other.events).toEqual([]);
+      expect(other.audit).toEqual([]);
+    });
     it("consumes exact approvals once and rejects stale or unapproved data", async () => {
       const { a, b, workspaceId } = await fixture();
       const policy = await savePolicy(a, policyData(a.shop, b.shop));

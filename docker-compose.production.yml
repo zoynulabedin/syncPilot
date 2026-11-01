@@ -16,6 +16,9 @@ x-app: &app
     SYNC_WRITE_ENABLED: ${SYNC_WRITE_ENABLED:-false}
     INVENTORY_WRITE_ENABLED: ${INVENTORY_WRITE_ENABLED:-false}
     LOG_LEVEL: ${LOG_LEVEL:-info}
+    ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+    ALERT_WEBHOOK_HOSTS: ${ALERT_WEBHOOK_HOSTS:-}
+    ALERT_WEBHOOK_TOKEN: ${ALERT_WEBHOOK_TOKEN:-}
   depends_on:
     postgres:
       condition: service_healthy
@@ -26,14 +29,39 @@ services:
   web:
     <<: *app
     expose: ["3000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
   worker:
     <<: *app
     command: ["npm", "run", "worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       disable: true
   migrate:
     <<: *app
-    profiles: ["tools"]
     restart: "no"
     command: ["npm", "run", "setup"]
     healthcheck:

@@ -5,7 +5,7 @@ export const SHOP_QUERY = `#graphql
 export const PRODUCTS_QUERY = `#graphql
   query SyncPilotProducts($after: String) {
     products(first: 100, after: $after, sortKey: ID) {
-      nodes { id title status handle descriptionHtml vendor productType tags updatedAt }
+      nodes { id title status handle descriptionHtml vendor productType tags updatedAt seo { title description } }
       pageInfo { hasNextPage endCursor }
     }
   }
@@ -13,7 +13,7 @@ export const PRODUCTS_QUERY = `#graphql
 export const VARIANTS_QUERY = `#graphql
   query SyncPilotVariants($after: String) {
     productVariants(first: 100, after: $after, sortKey: ID) {
-      nodes { id sku barcode price compareAtPrice selectedOptions { name value } product { id } inventoryItem { id tracked } }
+      nodes { id sku barcode price compareAtPrice taxable inventoryPolicy selectedOptions { name value } product { id } inventoryItem { id tracked } }
       pageInfo { hasNextPage endCursor }
     }
   }
@@ -37,8 +37,8 @@ export const INVENTORY_QUERY = `#graphql
 export const RESOURCES_QUERY = `#graphql
   query SyncPilotResources($ids: [ID!]!) {
     nodes(ids: $ids) {
-      ... on Product { id title status handle descriptionHtml vendor productType tags updatedAt }
-      ... on ProductVariant { id sku barcode price compareAtPrice selectedOptions { name value } product { id } inventoryItem { id tracked } }
+      ... on Product { id title status handle descriptionHtml vendor productType tags updatedAt seo { title description } }
+      ... on ProductVariant { id sku barcode price compareAtPrice taxable inventoryPolicy selectedOptions { name value } product { id } inventoryItem { id tracked } }
       ... on Location { id name isActive }
     }
   }

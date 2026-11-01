@@ -13,6 +13,7 @@ import {
   textField,
 } from "../components/actions.server";
 import { Changes, readChanges } from "../components/previews";
+import { Pagination, QueryFields } from "../components/list-navigation";
 import {
   EmptyState,
   Field,
@@ -29,14 +30,19 @@ import {
 
 export async function loader({ request }: LoaderFunctionArgs) {
   const actor = requireActor(await authenticate.admin(request));
+  const params = new URL(request.url).searchParams;
+  const filter = params.get("conflictStatus") ?? params.get("status") ?? "OPEN";
+  params.delete("status");
+  params.set("conflictStatus", filter);
+  params.set("previewStatus", "PENDING");
   const [operations, { policies }] = await Promise.all([
-    getOperations(actor),
+    getOperations(actor, params),
     getPolicies(actor),
   ]);
   return {
     ...operations,
     policies,
-    filter: new URL(request.url).searchParams.get("status") || "OPEN",
+    filter,
   };
 }
 export async function action({ request }: ActionFunctionArgs) {
@@ -59,7 +65,7 @@ export async function action({ request }: ActionFunctionArgs) {
 }
 
 export default function Conflicts() {
-  const { conflicts, previews, policies, canManage, filter } =
+  const { conflicts, previews, pages, policies, canManage, filter } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const visible = conflicts.filter(
@@ -83,8 +89,15 @@ export default function Conflicts() {
         description="No force-overwrite action is available. A retry requires fresh observations and a new approved plan."
       >
         <Form method="get" className="sp-search">
-          <Field name="status" label="Conflict state">
-            <select id="status" name="status" defaultValue={filter}>
+          <QueryFields
+            exclude={["status", "conflictStatus", "conflictsPage"]}
+          />
+          <Field name="conflictStatus" label="Conflict state">
+            <select
+              id="conflictStatus"
+              name="conflictStatus"
+              defaultValue={filter}
+            >
               <option value="OPEN">Open</option>
               <option value="RESOLVED">Resolved</option>
               <option value="">All states</option>
@@ -187,6 +200,11 @@ export default function Conflicts() {
             held here with context for review.
           </EmptyState>
         )}
+        <Pagination
+          info={pages.conflicts}
+          param="conflictsPage"
+          label="conflicts"
+        />
       </Section>
       <Section
         title="Plans awaiting review"
@@ -224,6 +242,7 @@ export default function Conflicts() {
             synchronization.
           </EmptyState>
         )}
+        <Pagination info={pages.previews} param="previewsPage" label="plans" />
       </Section>
     </Page>
   );

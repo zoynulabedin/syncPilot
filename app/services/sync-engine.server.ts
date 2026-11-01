@@ -8,10 +8,11 @@ import {
   assertCurrentPlan,
   assertWriteGates,
   buildSyncPreview,
-  money,
   mutationErrors,
   retryDelay,
   sameValue,
+  selectedValue,
+  targetedFields,
   stableHash,
   SyncError,
   type CatalogRecords,
@@ -43,7 +44,7 @@ const toJson = (value: unknown) => value as Prisma.InputJsonValue;
 const LEASE_MS = 120_000;
 const workerIdentity = `${hostname()}:${process.pid}:${randomUUID()}`;
 const changeSchema = z.object({
-  kind: z.enum(["PRODUCT", "PRICE", "INVENTORY", "HOLD"]),
+  kind: z.enum(["PRODUCT", "PRICE", "VARIANT", "INVENTORY", "HOLD"]),
   sourceId: z.string(),
   targetId: z.string().optional(),
   field: z.string().optional(),
@@ -231,6 +232,7 @@ async function importedState(
       vendor: p.vendor,
       productType: p.productType,
       tags: p.tags,
+      seo: productSchema.safeParse(p.data).data?.seo,
     })),
     variants: variants.map((v) => ({
       id: v.variantGid,
@@ -239,6 +241,8 @@ async function importedState(
       barcode: v.barcode,
       price: v.price,
       compareAtPrice: v.compareAtPrice,
+      taxable: variantSchema.safeParse(v.data).data?.taxable,
+      inventoryPolicy: variantSchema.safeParse(v.data).data?.inventoryPolicy,
       selectedOptions: Array.isArray(v.options)
         ? (v.options as { name: string; value: string }[])
         : [],
@@ -436,7 +440,7 @@ function groups(changes: SyncChange[]) {
 async function readResource<T extends ProductRecord | VariantRecord>(
   shop: string,
   id: string,
-  kind: "PRODUCT" | "PRICE",
+  kind: "PRODUCT" | "PRICE" | "VARIANT",
 ) {
   const { nodes } = await shopifyRequest<{ nodes: unknown[] }>(
     shop,
@@ -457,15 +461,13 @@ function resourceValue(
   record: ProductRecord | VariantRecord,
   field: string,
 ): Json {
-  if (!(field in record))
+  const value = selectedValue(record, field);
+  if (value === undefined)
     throw new SyncError(
       "INVALID_INPUT",
       "The selected field is not supported by this writer.",
     );
-  const value = (record as unknown as Record<string, Json>)[field];
-  if (field === "price" || field === "compareAtPrice")
-    return money(value as string | null);
-  return field === "tags" && Array.isArray(value) ? [...value].sort() : value;
+  return value;
 }
 async function executeGroup(
   policy: SyncPolicy,
@@ -541,7 +543,7 @@ async function executeGroup(
           "Product mapping changed after preview.",
         );
       if (
-        first.kind === "PRICE" &&
+        (first.kind === "PRICE" || first.kind === "VARIANT") &&
         !maps.variants.some(
           (m) =>
             m.verifiedAt &&
@@ -691,9 +693,7 @@ async function executeGroup(
                 "STALE_PREVIEW",
                 "A selected source or destination field changed after preview.",
               );
-          const fields = Object.fromEntries(
-            changes.map((c) => [c.field!, c.after]),
-          );
+          const fields = targetedFields(kind, changes);
           await verifyConsent();
           mutationStarted = true;
           if (kind === "PRODUCT") {

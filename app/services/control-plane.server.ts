@@ -12,6 +12,7 @@ import {
   DomainError,
   PRODUCT_FIELDS,
   PRICE_FIELDS,
+  VARIANT_FIELDS,
   SYNC_FIELDS,
   assertPairingUsable,
   assertSafePreview,
@@ -23,6 +24,8 @@ import {
   validateGid,
 } from "../domain/guards";
 import { stableHash } from "../domain/sync";
+import { listPage } from "./listing.server";
+import { alertDestination } from "./alert-transport.server";
 
 export { DomainError } from "../domain/guards";
 type Tx = Prisma.TransactionClient;
@@ -463,12 +466,48 @@ async function workspaceOrEmpty(actor: Actor) {
   if (!connection.workspaceId) return null;
   return requireWorkspace(actor);
 }
-export async function getMappings(actor: Actor) {
+export async function getMappings(
+  actor: Actor,
+  params = new URLSearchParams(),
+) {
   const context = await workspaceOrEmpty(actor);
   const shops = context?.connections.map(
     (connection) => connection.shopDomain,
   ) ?? [actor.shop];
   const workspaceId = context?.workspaceId ?? "__unpaired__";
+  const kind = z
+    .enum(["PRODUCT", "VARIANT", "LOCATION"])
+    .catch("PRODUCT")
+    .parse(params.get("kind"));
+  const q = (params.get("q") || "").trim().slice(0, 120);
+  const resourceQ = (params.get("resourceQ") || "").trim().slice(0, 120);
+  const contains = (value: string) => ({
+    contains: value,
+    mode: "insensitive" as const,
+  });
+  const mappingWhere = (source: string, target: string) => ({
+    workspaceId,
+    ...(q
+      ? {
+          OR: [source, target, "sourceShopDomain", "targetShopDomain"].map(
+            (key) => ({ [key]: contains(q) }),
+          ),
+        }
+      : {}),
+  });
+  const snapshotWhere = (keys: string[]) => ({
+    shopDomain: { in: shops },
+    ...(resourceQ
+      ? { OR: keys.map((key) => ({ [key]: contains(resourceQ) })) }
+      : {}),
+  });
+  const pWhere = mappingWhere("sourceProductGid", "targetProductGid");
+  const vWhere = mappingWhere("sourceVariantGid", "targetVariantGid");
+  const lWhere = mappingWhere("sourceLocationGid", "targetLocationGid");
+  const psWhere = snapshotWhere(["title", "handle", "productGid"]);
+  const vsWhere = snapshotWhere(["sku", "barcode", "variantGid", "productGid"]);
+  const lsWhere = snapshotWhere(["name", "locationGid"]);
+  const empty = { rows: [], pageInfo: { total: 0, page: 1, pageSize: 25 } };
   const [
     products,
     variants,
@@ -477,45 +516,102 @@ export async function getMappings(actor: Actor) {
     variantSnapshots,
     locationSnapshots,
   ] = await Promise.all([
-    prisma.productMapping.findMany({
-      where: { workspaceId },
-      orderBy: { createdAt: "desc" },
-      take: 500,
-    }),
-    prisma.variantMapping.findMany({
-      where: { workspaceId },
-      orderBy: { createdAt: "desc" },
-      take: 1000,
-    }),
-    prisma.locationMapping.findMany({
-      where: { workspaceId },
-      orderBy: { createdAt: "desc" },
-      take: 250,
-    }),
-    prisma.productSnapshot.findMany({
-      where: { shopDomain: { in: shops } },
-      orderBy: { title: "asc" },
-      take: 1000,
-    }),
-    prisma.variantSnapshot.findMany({
-      where: { shopDomain: { in: shops } },
-      orderBy: { sku: "asc" },
-      take: 5000,
-    }),
-    prisma.locationSnapshot.findMany({
-      where: { shopDomain: { in: shops } },
-      orderBy: { name: "asc" },
-      take: 250,
-    }),
+    kind === "PRODUCT"
+      ? listPage(
+          params.get("mappingPage"),
+          () => prisma.productMapping.count({ where: pWhere }),
+          (window) =>
+            prisma.productMapping.findMany({
+              where: pWhere,
+              orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+              ...window,
+            }),
+        )
+      : empty,
+    kind === "VARIANT"
+      ? listPage(
+          params.get("mappingPage"),
+          () => prisma.variantMapping.count({ where: vWhere }),
+          (window) =>
+            prisma.variantMapping.findMany({
+              where: vWhere,
+              orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+              ...window,
+            }),
+        )
+      : empty,
+    kind === "LOCATION"
+      ? listPage(
+          params.get("mappingPage"),
+          () => prisma.locationMapping.count({ where: lWhere }),
+          (window) =>
+            prisma.locationMapping.findMany({
+              where: lWhere,
+              orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+              ...window,
+            }),
+        )
+      : empty,
+    kind === "PRODUCT"
+      ? listPage(
+          params.get("resourcePage"),
+          () => prisma.productSnapshot.count({ where: psWhere }),
+          (window) =>
+            prisma.productSnapshot.findMany({
+              where: psWhere,
+              orderBy: [{ title: "asc" }, { id: "asc" }],
+              ...window,
+            }),
+        )
+      : empty,
+    kind === "VARIANT"
+      ? listPage(
+          params.get("resourcePage"),
+          () => prisma.variantSnapshot.count({ where: vsWhere }),
+          (window) =>
+            prisma.variantSnapshot.findMany({
+              where: vsWhere,
+              orderBy: [{ sku: "asc" }, { id: "asc" }],
+              ...window,
+            }),
+        )
+      : empty,
+    kind === "LOCATION"
+      ? listPage(
+          params.get("resourcePage"),
+          () => prisma.locationSnapshot.count({ where: lsWhere }),
+          (window) =>
+            prisma.locationSnapshot.findMany({
+              where: lsWhere,
+              orderBy: [{ name: "asc" }, { id: "asc" }],
+              ...window,
+            }),
+        )
+      : empty,
   ]);
   return {
-    products,
-    variants,
-    locations,
+    products: products.rows,
+    variants: variants.rows,
+    locations: locations.rows,
+    kind,
+    q,
+    resourceQ,
+    mappingPage: (kind === "PRODUCT"
+      ? products
+      : kind === "VARIANT"
+        ? variants
+        : locations
+    ).pageInfo,
+    resourcePage: (kind === "PRODUCT"
+      ? productSnapshots
+      : kind === "VARIANT"
+        ? variantSnapshots
+        : locationSnapshots
+    ).pageInfo,
     snapshots: {
-      products: productSnapshots,
-      variants: variantSnapshots,
-      locations: locationSnapshots,
+      products: productSnapshots.rows,
+      variants: variantSnapshots.rows,
+      locations: locationSnapshots.rows,
     },
     connections: context?.connections ?? [await currentConnection(actor)],
     canManage: actor.role === "OWNER",
@@ -904,6 +1000,9 @@ export async function savePolicy(actor: Actor, input: unknown) {
       syncPrices: fields.some((field) =>
         (PRICE_FIELDS as readonly string[]).includes(field),
       ),
+      syncVariants: fields.some((field) =>
+        (VARIANT_FIELDS as readonly string[]).includes(field),
+      ),
       syncInventory: data.syncInventory,
       inventoryMode: data.syncInventory ? "SOURCE" : "DISABLED",
       inventoryAuthority: data.syncInventory ? sourceShop : null,
@@ -1187,60 +1286,139 @@ export async function approvePreview(actor: Actor, previewId: string) {
     return job;
   });
 }
-export async function getOperations(actor: Actor) {
+export async function getOperations(
+  actor: Actor,
+  params = new URLSearchParams(),
+) {
   const context = await workspaceOrEmpty(actor);
   const workspaceId = context?.workspaceId ?? "__unpaired__";
-  const [jobs, conflicts, previews, reconciliations, auditEvents, heartbeats] =
-    await Promise.all([
-      prisma.syncJob.findMany({
-        where: context
-          ? { workspaceId }
-          : {
-              sourceShop: actor.shop,
-              targetShop: actor.shop,
-              operation: "CATALOG_IMPORT",
-            },
-        orderBy: { createdAt: "desc" },
-        take: 50,
-      }),
-      prisma.syncConflict.findMany({
-        where: { workspaceId },
-        orderBy: { createdAt: "desc" },
-        take: 50,
-      }),
-      prisma.syncPreview.findMany({
-        where: { workspaceId },
-        orderBy: { createdAt: "desc" },
-        take: 20,
-      }),
-      prisma.reconciliationRun.findMany({
-        where: { workspaceId },
-        orderBy: { startedAt: "desc" },
-        take: 20,
-      }),
-      prisma.auditEvent.findMany({
-        where: context
-          ? { workspaceId }
-          : { shopDomain: actor.shop, workspaceId: null },
-        orderBy: { createdAt: "desc" },
-        take: 50,
-      }),
-      prisma.workerHeartbeat.findMany({ orderBy: { seenAt: "desc" }, take: 5 }),
-    ]);
-  const attempts = await prisma.syncAttempt.findMany({
-    where: { jobId: { in: jobs.map((job) => job.id) } },
-    orderBy: { attempt: "desc" },
-    take: 250,
-  });
-  return {
-    jobs: jobs.map((job) => ({
-      ...job,
-      attempts: attempts.filter((attempt) => attempt.jobId === job.id),
-    })),
+  const jobStatus = (params.get("status") || "").slice(0, 40);
+  const jobId = (params.get("job") || "").slice(0, 100);
+  const conflictStatus = (params.get("conflictStatus") || "").slice(0, 40);
+  const jobsWhere = {
+    ...(context
+      ? { workspaceId }
+      : {
+          sourceShop: actor.shop,
+          targetShop: actor.shop,
+          operation: "CATALOG_IMPORT",
+        }),
+    ...(jobStatus ? { status: jobStatus } : {}),
+    ...(jobId ? { id: jobId } : {}),
+  };
+  const conflictsWhere = {
+    workspaceId,
+    ...(conflictStatus ? { status: conflictStatus } : {}),
+  };
+  const previewWhere = {
+    workspaceId,
+    ...(params.get("previewStatus")
+      ? { status: params.get("previewStatus")!.slice(0, 40) }
+      : {}),
+  };
+  const auditWhere = context
+    ? { workspaceId }
+    : { shopDomain: actor.shop, workspaceId: null };
+  const eventWhere = {
+    shopDomain: {
+      in: context?.connections.map((connection) => connection.shopDomain) ?? [
+        actor.shop,
+      ],
+    },
+  };
+  const [
+    jobs,
     conflicts,
     previews,
     reconciliations,
-    audit: auditEvents,
+    auditEvents,
+    events,
+    heartbeats,
+  ] = await Promise.all([
+    listPage(
+      params.get("jobsPage"),
+      () => prisma.syncJob.count({ where: jobsWhere }),
+      (window) =>
+        prisma.syncJob.findMany({
+          where: jobsWhere,
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+          ...window,
+        }),
+    ),
+    listPage(
+      params.get("conflictsPage"),
+      () => prisma.syncConflict.count({ where: conflictsWhere }),
+      (window) =>
+        prisma.syncConflict.findMany({
+          where: conflictsWhere,
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+          ...window,
+        }),
+    ),
+    listPage(
+      params.get("previewsPage"),
+      () => prisma.syncPreview.count({ where: previewWhere }),
+      (window) =>
+        prisma.syncPreview.findMany({
+          where: previewWhere,
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+          ...window,
+        }),
+    ),
+    listPage(
+      params.get("runsPage"),
+      () => prisma.reconciliationRun.count({ where: { workspaceId } }),
+      (window) =>
+        prisma.reconciliationRun.findMany({
+          where: { workspaceId },
+          orderBy: [{ startedAt: "desc" }, { id: "desc" }],
+          ...window,
+        }),
+    ),
+    listPage(
+      params.get("auditPage"),
+      () => prisma.auditEvent.count({ where: auditWhere }),
+      (window) =>
+        prisma.auditEvent.findMany({
+          where: auditWhere,
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+          ...window,
+        }),
+    ),
+    listPage(
+      params.get("eventsPage"),
+      () => prisma.webhookEvent.count({ where: eventWhere }),
+      (window) =>
+        prisma.webhookEvent.findMany({
+          where: eventWhere,
+          orderBy: [{ receivedAt: "desc" }, { id: "desc" }],
+          ...window,
+        }),
+    ),
+    prisma.workerHeartbeat.findMany({ orderBy: { seenAt: "desc" }, take: 5 }),
+  ]);
+  const attempts = await prisma.syncAttempt.findMany({
+    where: { jobId: { in: jobs.rows.map((job) => job.id) } },
+    orderBy: { attempt: "desc" },
+  });
+  return {
+    jobs: jobs.rows.map((job) => ({
+      ...job,
+      attempts: attempts.filter((attempt) => attempt.jobId === job.id),
+    })),
+    conflicts: conflicts.rows,
+    previews: previews.rows,
+    reconciliations: reconciliations.rows,
+    audit: auditEvents.rows,
+    events: events.rows,
+    pages: {
+      jobs: jobs.pageInfo,
+      conflicts: conflicts.pageInfo,
+      previews: previews.pageInfo,
+      runs: reconciliations.pageInfo,
+      audit: auditEvents.pageInfo,
+      events: events.pageInfo,
+    },
     heartbeats,
     canManage: actor.role === "OWNER",
   };
@@ -1432,6 +1610,35 @@ export async function getSettings(actor: Actor) {
   return {
     workspace: context?.workspace ?? null,
     notification,
+    externalAlertsConfigured: !!alertDestination(),
+    notificationDeliveries: context
+      ? await prisma.notificationDelivery.findMany({
+          where: { workspaceId: context.workspaceId },
+          orderBy: { createdAt: "desc" },
+          take: 10,
+          select: {
+            id: true,
+            status: true,
+            attempts: true,
+            errorCode: true,
+            createdAt: true,
+            deliveredAt: true,
+          },
+        })
+      : [],
+    privacyRequests: await prisma.privacyRequest.findMany({
+      where: { shopDomain: actor.shop },
+      orderBy: { receivedAt: "desc" },
+      take: 25,
+      select: {
+        id: true,
+        topic: true,
+        status: true,
+        outcome: true,
+        receivedAt: true,
+        completedAt: true,
+      },
+    }),
     canManage: actor.role === "OWNER",
     ...flags(),
   };
@@ -1443,16 +1650,25 @@ export async function updateSettings(actor: Actor, input: unknown) {
       name: z.string().trim().min(1).max(100).optional(),
       reconciliationMinutes: z.number().int().min(5).max(10080).optional(),
       retentionDays: z.number().int().min(7).max(3650).optional(),
+      retentionEnabled: z.boolean().optional(),
       notificationsEnabled: z.boolean().optional(),
+      externalNotificationsEnabled: z.boolean().optional(),
       failureThreshold: z.number().int().min(1).max(100).optional(),
       lagMinutes: z.number().int().min(1).max(1440).optional(),
     })
     .strict()
     .parse(input);
+  if (data.externalNotificationsEnabled && !alertDestination())
+    throw new DomainError(
+      "ALERT_DESTINATION_REQUIRED",
+      "The deployment operator must configure an HTTPS alert destination before you can enable delivery.",
+      409,
+    );
   return serial(async (tx) => {
     const context = await requireWorkspace(actor, tx);
     const {
       notificationsEnabled,
+      externalNotificationsEnabled,
       failureThreshold,
       lagMinutes,
       ...workspaceData
@@ -1470,6 +1686,9 @@ export async function updateSettings(actor: Actor, input: unknown) {
           : { enabled: notificationsEnabled }),
         ...(failureThreshold === undefined ? {} : { failureThreshold }),
         ...(lagMinutes === undefined ? {} : { lagMinutes }),
+        ...(externalNotificationsEnabled === undefined
+          ? {}
+          : { externalEnabled: externalNotificationsEnabled }),
       },
       update: {
         ...(notificationsEnabled === undefined
@@ -1477,6 +1696,9 @@ export async function updateSettings(actor: Actor, input: unknown) {
           : { enabled: notificationsEnabled }),
         ...(failureThreshold === undefined ? {} : { failureThreshold }),
         ...(lagMinutes === undefined ? {} : { lagMinutes }),
+        ...(externalNotificationsEnabled === undefined
+          ? {}
+          : { externalEnabled: externalNotificationsEnabled }),
       },
     });
     await audit(

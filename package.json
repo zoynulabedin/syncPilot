@@ -21,10 +21,13 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:integration": "node --env-file-if-exists=.env scripts/test-integration.mjs",
-    "test:e2e": "node --env-file-if-exists=.env node_modules/@playwright/test/cli.js test",
+    "test:backup": "node --env-file-if-exists=.env scripts/test-integration.mjs --backup",
+    "test:e2e": "node --env-file-if-exists=.env scripts/test-integration.mjs --http",
     "worker": "node --env-file-if-exists=.env --import tsx scripts/worker.ts",
     "check": "npm run typecheck && npm run lint && npm test && npm run build",
-    "sessions:encrypt": "node --env-file-if-exists=.env --import tsx scripts/encrypt-sessions.ts"
+    "sessions:encrypt": "node --env-file-if-exists=.env --import tsx scripts/encrypt-sessions.ts",
+    "backup:encrypted": "node --env-file-if-exists=.env --import tsx scripts/backup-encrypted.ts",
+    "restore:encrypted": "node --env-file-if-exists=.env --import tsx scripts/restore-encrypted.ts"
   },
   "type": "module",
   "engines": {

@@ -33,9 +33,18 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Install PostgreSQL 17 backup clients
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common ca-certificates
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
       - run: npm ci
       - run: npm exec prisma validate
       - run: npm run setup
       - run: npm run check
       - run: npm run test:integration
+      - run: npm run test:backup
       - run: npm run test:e2e
