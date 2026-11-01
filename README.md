@@ -10,11 +10,11 @@ Private Shopify product and inventory synchronization with verified two-store pa
 - Expiring, hashed pairing challenges; acceptance in the second installation and confirmation by the initiating owner; tenant checks and read-only staff membership.
 - Checkpointed product, variant, location, and per-location inventory imports; searchable catalog and inventory pages.
 - Explicit GID mappings and parent-variant validation. SKU/barcode suggestions never authorize a mapping alone.
-- Source ownership for title, description HTML, vendor, product type, handle, tags, status, variant price, and compare-at price. Reverse policies must own different fields.
+- Source ownership for title, description HTML, vendor, product type, handle, tags, status, SEO title/description, variant price, compare-at price, SKU, taxability and inventory policy. Reverse policies must own different fields.
 - Exact, expiring dry runs and single-use approvals. Targeted product/price updates; authoritative available-inventory writes with a safety buffer, expected-quantity CAS and Shopify idempotency.
 - Durable PostgreSQL inbox/jobs, leased processing, resource locks, bounded retries, dead letters, conflict review, cancellation and conservative recovery after uncertain writes.
-- Read-only scheduled/on-demand reconciliation, real job/audit views, in-app operational alerts, settings, and help.
-- AES-256-GCM access/refresh token storage with context authentication; generic liveness/readiness probes; local backup and disposable restore rehearsal tools.
+- Read-only scheduled/on-demand reconciliation; searchable, paginated mappings and history; in-app alerts and optional durable external webhook alerts; owner-opted history retention and authenticated privacy handling.
+- AES-256-GCM access/refresh token storage with context authentication; generic liveness/readiness probes; encrypted streaming backups and disposable restore drills that verify session-key recovery.
 
 ## Local development
 
@@ -56,9 +56,11 @@ An authoritative inventory policy needs a business stock model that handles dest
 ```bash
 npm run check
 npm run test:integration
-npm run test:e 2 e
-bash scripts/backup-local.sh
-bash scripts/restore-drill.sh backups/your-backup.dump
+npm run test:e2e
+npm run test:backup
+# Trusted operator host, with BACKUP_ENCRYPTION_KEY and SESSION_ENCRYPTION_KEY in secret storage:
+npm run backup:encrypted
+npm run restore:encrypted -- backups/your-backup.spbk
 ```
 
 `check` runs typecheck, lint, unit tests and build. Integration tests create, migrate and drop a generated local `syncpilot_test_*` database and exercise synthetic Shopify responses, including 10,000 products, concurrency, CAS, duplicate deliveries, interruption and revocation. HTTP smoke tests start the built server with synthetic Shopify credentials and check probes, authentication rejection and forged-webhook rejection; they do not substitute for an authenticated browser/two-store test.
@@ -67,7 +69,7 @@ bash scripts/restore-drill.sh backups/your-backup.dump
 
 `Dockerfile` and `docker-compose.production.yml` provide web, worker, PostgreSQL, Redis and a separate migration task. Do not deploy them with development credentials. Configure a separate staging app/domain/secrets, run migrations once, keep write flags off, and complete real two-store acceptance before a production pilot.
 
-Unsupported: new product creation, variant structure changes, media/metafields/collections, shared-pool ledger allocation, unrestricted two-way inventory, unattended mutation consent, external notification delivery and automatic retention purge. Mapping/history displays are bounded; large mapping administration needs pagination. Shopify product/price mutations have a read-to-write concurrency gap; inventory has API CAS. See the status and security documents before enabling writes.
+Unsupported: new product creation, variant structure changes, media/metafields/collections, shared-pool ledger allocation, unrestricted two-way inventory, unattended mutation consent and fully general role delegation. Policy selectors still show at most 50 policies and 20 recent previews; the dedicated history pages paginate. Shopify product/price mutations have a read-to-write concurrency gap; inventory has API CAS. See the status and security documents before enabling writes.
 
 - [Implementation status](docs/IMPLEMENTATION_STATUS.md)
 - [Architecture](docs/ARCHITECTURE.md)
@@ -79,3 +81,5 @@ Unsupported: new product creation, variant structure changes, media/metafields/c
 - [Shopify API contracts](docs/SHOPIFY_CONTRACTS.md)
 
 Scaffolding is adapted from Shopify's official React Router template; see LICENSE.md.
+
+Encrypted backup commands require compatible PostgreSQL client tools on a trusted operator host; the application runtime image does not include them. External alert delivery and retention are off until the owner opts in. See [operations](docs/RUNBOOK.md), [alerts](docs/NOTIFICATIONS.md), and [staging setup](docs/COOLIFY_STAGING.md). The owner chose to keep the two development stores separate; this work does not authorize pairing or writes.

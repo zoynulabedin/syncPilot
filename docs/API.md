@@ -52,22 +52,22 @@ Organization eligibility is attested by both owners. No Admin API organization-o
 
 `savePolicy(actor, input)` accepts:
 
-| Field                      | Rules                                                                                                                       |
-| -------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `id`                       | Optional existing policy ID in this workspace; enabled policies must first be paused                                        |
-| `sourceShop`, `targetShop` | Different active stores in the verified pair                                                                                |
-| `fields`                   | Any selection of `title`, `descriptionHtml`, `vendor`, `productType`, `status`, `handle`, `tags`, `price`, `compareAtPrice` |
-| `syncInventory`            | Boolean; false by default                                                                                                   |
-| `inventoryMode`            | `DISABLED` or `SOURCE`; inventory requires `SOURCE`                                                                         |
-| `inventoryAuthority`       | Must equal `sourceShop` for inventory synchronization                                                                       |
-| `buffer`                   | Integer from 0 through 1,000,000                                                                                            |
-| `reconciliationMinutes`    | Integer from 5 through 10,080                                                                                               |
+| Field                      | Rules                                                                                                                                                                                          |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`                       | Optional existing policy ID in this workspace; enabled policies must first be paused                                                                                                           |
+| `sourceShop`, `targetShop` | Different active stores in the verified pair                                                                                                                                                   |
+| `fields`                   | Any selection of `title`, `descriptionHtml`, `vendor`, `productType`, `status`, `handle`, `tags`, `seoTitle`, `seoDescription`, `price`, `compareAtPrice`, `sku`, `taxable`, `inventoryPolicy` |
+| `syncInventory`            | Boolean; false by default                                                                                                                                                                      |
+| `inventoryMode`            | `DISABLED` or `SOURCE`; inventory requires `SOURCE`                                                                                                                                            |
+| `inventoryAuthority`       | Must equal `sourceShop` for inventory synchronization                                                                                                                                          |
+| `buffer`                   | Integer from 0 through 1,000,000                                                                                                                                                               |
+| `reconciliationMinutes`    | Integer from 5 through 10,080                                                                                                                                                                  |
 
 At least one field or inventory must be selected. Opposing policies cannot own the same field or both own inventory. Bidirectional product ownership therefore uses two one-way policies with disjoint fields. Saving sets `DRAFT`, disables the policy, and invalidates prior approvals. Inventory shared-pool allocation is not an available mode.
 
 ## Preview, activation and approved execution
 
-`previewPolicy(actor, policyId)` authorizes both stores and persists exact changes, source/target hashes, creator and 15-minute expiry. Previewing never writes to Shopify. Plans can contain `PRODUCT`, `PRICE`, `INVENTORY` changes or `HOLD` findings. Unknown, held, empty or more-than-1,000-change plans cannot be approved.
+`previewPolicy(actor, policyId)` authorizes both stores and persists exact changes, source/target hashes, creator and 15-minute expiry. Previewing never writes to Shopify. Plans can contain `PRODUCT`, `PRICE`, `VARIANT`, `INVENTORY` changes or `HOLD` findings. Unknown, held, empty or more-than-1,000-change plans cannot be approved.
 
 `updatePolicy(actor, policyId, "ACTIVATE")` requires a fresh nonempty dry run, no held items, no opposing ownership conflict and enabled deployment switches. `PAUSE` cancels associated queued/running work and revokes approved plans. Activation alone does not authorize arbitrary future mutations.
 
@@ -75,7 +75,7 @@ At least one field or inventory must be selected. Opposing policies cannot own t
 
 The deployment variables `SYNC_WRITE_ENABLED` and `INVENTORY_WRITE_ENABLED` must equal the lowercase string `true`; inventory requires both. They are off by default. Services and workers independently enforce these switches. Enabling a switch does not skip pairing, mapping, policy or exact-plan approval.
 
-The worker fetches current Shopify state, compares the exact approved plan again, and rechecks authorization before resource writes. Product fields use targeted updates; variant prices use targeted variant updates; inventory uses available quantity, explicit location mapping, Shopify compare-and-set and a stable idempotency key. Destructive product creation/deletion, media/options/metafields and shared-pool inventory are unsupported and must remain held.
+The worker fetches current Shopify state, compares the exact approved plan again, and rechecks authorization before resource writes. Product fields use targeted updates; variant prices and selected SKU/taxability/inventory-policy fields use targeted variant updates; inventory uses available quantity, explicit location mapping, Shopify compare-and-set and a stable idempotency key. Destructive product creation/deletion, media/options/metafields and shared-pool inventory are unsupported and must remain held.
 
 ## Jobs, conflicts and reconciliation
 
@@ -87,13 +87,15 @@ The worker fetches current Shopify state, compares the exact approved plan again
 
 ## Preferences and read bounds
 
-`updateSettings` accepts optional workspace name (1–100 characters), reconciliation interval (5–10,080 minutes), retention target (7–3,650 days), in-app alert enablement, failure threshold (1–100), and queue-lag threshold (1–1,440 minutes). Retention is a stored target; automated purging and external notification delivery are not implemented.
+`updateSettings` accepts optional workspace name (1–100 characters), reconciliation interval (5–10,080 minutes), retention target (7–3,650 days), `retentionEnabled`, `notificationsEnabled`, `externalNotificationsEnabled`, failure threshold (1–100), and queue-lag threshold (1–1,440 minutes). An owner must opt in to retention and external delivery. External enablement also requires an operator-configured valid HTTPS destination/host allowlist. See NOTIFICATIONS.md for the bounded durable outbox contract.
 
-Service reads are bounded: policies 50; plans 20; jobs/conflicts/audit 50; reconciliation runs 20; staff members 100; displayed mapping products 500, variants 1,000 and locations 250; imported identity selectors products 1,000, variants 5,000 and locations 250. These are display bounds, not a claim of a fully paginated mapping API. Large mapping management needs further pagination before large-catalog rollout. Catalog imports use Shopify pagination independently.
+Mappings and imported suggestions support kind/search filters and independent 25-row pages. Activity, plans, receipts, conflicts, reconciliation runs and audit history also paginate; filtering occurs in the database before paging. Legacy detail IDs remain tenant scoped. Policy configuration selectors remain bounded at 50 policies and 20 recent previews; staff lists are capped at 100. Catalog discovery independently paginates the complete Shopify catalog.
 
 ## Webhooks and probes
 
 Configured product/inventory webhook routes call `authenticate.webhook(request)` before receipt persistence. Delivery IDs are required and unique per shop. The durable inbox/outbox flow creates idempotent worker jobs. Verified uninstall clears sessions and revokes the pair/workspace even when a session is already absent; scope-change handling updates scope metadata, pauses policies, revokes plans and cancels writes. Test these lifecycle paths with real development-store events before release.
+
+`POST /webhooks/privacy` authenticates Shopify HMAC before persisting a deduplicated receipt without customer payloads. Customer requests complete with the no-customer-data outcome. Shop redaction is processed after uninstall; a changed/reinstalled connection is held for review. Erasure removes that store's private data and shared workspace state while preserving another store's private catalog and sessions. `GET /privacy` describes data handling.
 
 `GET /health` returns `ok` and reports process liveness only. `GET /ready` checks the database and configured Redis and returns `{"status":"ready"}` or a generic 503 response; it exposes no credentials or dependency addresses. Neither probe establishes two-store Shopify connectivity or release readiness.
 

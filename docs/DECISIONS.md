@@ -1,6 +1,6 @@
 # Decisions and open requirements
 
-Date: 2026-11-01 (Asia/Dhaka). Branch: codex/complete-syncpilot.
+Date: 2026-11-02 (Asia/Dhaka). Branch: codex/complete-syncpilot.
 
 ## Implemented choices
 
@@ -15,11 +15,13 @@ Date: 2026-11-01 (Asia/Dhaka). Branch: codex/complete-syncpilot.
 
 ## User-supplied second store
 
-The owner supplied rankup-ai.myshopify.com. Read-only admin inspection showed the store's dev label and an existing SyncPilot app link. No new installation, pairing approval or stock/product mutation was performed. The local database had only the Quickstart installation at the last check; both live owner flows still need verification.
+The owner supplied rankup-ai.myshopify.com and explicitly answered **Keep stores separate** when asked about read-only pairing. Both existing installations are independently connected. Quickstart's completed read-only import contains 17 products/26 variants/2 locations; Rankup's contains 2 products/13 variants/1 location. Local metadata confirms no workspace association, no pair, no active policy and disabled product/inventory write switches. Do not create or accept a pairing request under the current instruction.
+
+The added field adapters cover selected SEO title/description, SKU, taxability and inventory policy. They do not authorize those fields for any real store. Retention and external alert delivery require owner opt-in; no destination is configured or contacted. The encrypted backup CLI is operator-host tooling, with separate backup/session keys. All five additive/initial migrations have been applied locally after a backup.
 
 ## Activation decisions still required
 
-- Confirm store distribution eligibility and authorized owners on both actual installations.
+- If the owner later requests pairing, confirm distribution eligibility and obtain both actual owners' approvals then. The current separate-store decision remains in force.
 - Define physical stock authority and how destination sales feed that authority; identify exact inventory locations and whether stock pools are shared or independent.
 - Approve field ownership, currency handling, buffers and the selected pilot resources.
 - Supply staging domain/app configuration, hosting access, secrets, alert destination and backup owner.

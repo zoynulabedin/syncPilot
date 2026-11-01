@@ -6,9 +6,11 @@ From the root checkout, run docker compose up -d --wait postgres redis, npm ci, 
 
 Check /health for liveness and /ready for database/configured-Redis readiness. Settings shows worker heartbeat; Activity shows actual attempts and errors. A healthy web process does not prove that a worker, store pair or Shopify permissions are healthy.
 
-Run npm run check, npm run test:integration and npm run test:e 2 e. Integration runner creates a fresh generated local database and refuses arbitrary remote targets. It drops only that generated database. Tests never authorize real Shopify mutations.
+Run npm run check, npm run test:integration and npm run test:e2e. Integration runner creates a fresh generated local database and refuses arbitrary remote targets. It drops only that generated database. Tests never authorize real Shopify mutations.
 
 ## Pair and operate
+
+The current owner instruction is to keep both stores separate. The following pairing procedure is for a later explicitly authorized connection; do not initiate it under the current decision.
 
 Open the app in each eligible store as its owner. Create a pairing request in the source installation; share its request ID/challenge securely with the destination owner. Accept there and confirm from the initiating owner. Do not send Shopify tokens manually. Owner transfer requires disconnect and re-pair.
 
@@ -28,15 +30,24 @@ Cancellation cannot recall a mutation already accepted by Shopify. Product/price
 
 ## Backup and restore
 
-Run bash scripts/backup-local.sh. Files are permission-restricted and gitignored, but database dumps themselves are not encrypted by that script. Encrypt before offsite transfer and store SESSION_ENCRYPTION_KEY separately in secure storage. Legacy pre-migration dumps may contain plaintext credentials; never upload them to chat or Git.
+Use a trusted operator host with Node 22.12+, project dependencies, and `pg_dump`/`pg_restore` compatible with the PostgreSQL server (17 for this deployment). The runtime image does not contain these client tools. Ubuntu CI installs the client from the [official PostgreSQL Apt repository](https://www.postgresql.org/download/linux/ubuntu/).
 
-After configuring the persistent key, npm run sessions:encrypt encrypts legacy access/refresh rows with optimistic conditions and never prints credentials. Back up the key before migration. Never replace it without a key migration/reauthentication plan.
+Configure `DATABASE_URL`, a persistent base64 32-byte `BACKUP_ENCRYPTION_KEY`, and the separately stored `SESSION_ENCRYPTION_KEY` in secret storage. Keep the two keys independently recoverable from backups. Do not paste key values into command arguments or logs. The backup key encrypts the whole dump; the session key decrypts restored Shopify tokens.
 
-Run bash scripts/restore-drill.sh backups/file.dump to restore only into a generated disposable database, inspect applied migrations, then drop that test database. The normal application database is not replaced. A local restore rehearsal passed during this session; staging encrypted-offsite/PITR restore and restored token decryption still need operational acceptance.
+```sh
+npm run backup:encrypted
+npm run restore:encrypted -- backups/your-backup.spbk
+```
+
+The backup streams through authenticated AES-256-GCM into a permission-restricted, gitignored file and refuses to overwrite an existing path. The restore drill authenticates the entire backup, restores only into a generated local disposable database, verifies applied migrations and every encrypted session, then drops the disposable database. It never replaces the application database. A wrong backup/session key fails the drill. Maintain an independent erasure register and replay erasures before using a recovered database.
+
+`npm run test:backup` runs the full drill with synthetic sessions and temporary keys in a disposable database. It passed with five migrations, successful session decryption and rejection of a wrong session key. This proves the local recovery path; offsite transfer, recovery permissions, scheduling, backup-age monitoring and actual offsite restore remain operator acceptance tasks.
+
+The older `backup-local.sh`/`restore-drill.sh` scripts produce plaintext local dumps for development diagnostics. Those dumps are not offsite-ready. Legacy pre-encryption dumps may contain plaintext credentials; never upload them to chat or Git.
 
 ## Staging and release
 
-Use a distinct Shopify staging app/configuration and HTTPS domain. Set production secrets in the hosting secret manager, persistent database/Redis storage and a stable session key. docker-compose.production.yml contains web, worker, postgres, redis and a tools-profile migration service. Run the migration task once before bringing up app replicas; do not make every replica race migrations.
+Use a distinct Shopify staging app/configuration and HTTPS domain. Set production secrets in the hosting secret manager, persistent database/Redis storage and a stable session key. docker-compose.production.yml contains web, worker, postgres, redis and a one-shot migration service. Web and worker depend on successful migration completion; do not make every replica race migrations. See COOLIFY_STAGING.md for the ordered setup.
 
 Keep both write flags false. Complete two-real-development-store installation/owner/pairing/import/webhook tests, an explicitly approved small field pilot, inventory concurrent-sale/CAS tests and crash recovery. Configure ingress limits, encrypted backups, monitoring, alert delivery, support ownership and rollback. No staging/production deployment has been performed by this work.
 

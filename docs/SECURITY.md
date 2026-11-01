@@ -62,7 +62,9 @@ Shop domains are canonical `*.myshopify.com` names and Shopify IDs are checked b
 
 Audit records identify actor, operation, shop/workspace, resource and sanitized metadata. Do not log tokens, authentication headers, raw webhook payloads or arbitrary GraphQL responses. Session storage encryption does not encrypt all catalog/audit columns; database access control and encrypted infrastructure/backups remain deployment responsibilities. Public probes return generic status and do not expose topology or credentials.
 
-Retention preferences currently record a policy target only. Automated purging, privacy erasure workflows, immutable/tamper-evident audit storage and external alert delivery require further implementation/operational acceptance. The audit table is an application audit log, not a cryptographically immutable ledger.
+Retention is off by default and requires persisted owner opt-in. Daily bounded cleanup removes eligible old closed history and audit records, while open conflicts, failed/held jobs and current catalog data are preserved. Authenticated privacy deliveries discard customer payloads; shop erasure removes the uninstalled store's data and shared workspace history without deleting the other store's private catalog or sessions. A changed/reinstalled connection holds erasure for review. Restore operators must maintain an independent erasure register and replay it before enabling restored backups.
+
+External alerts require an operator-configured HTTPS destination/host allowlist and workspace-owner opt-in. The transport rejects private/reserved addresses, pins a validated address for the TLS request, does not follow redirects, and discards response bodies. Durable retries reuse a delivery ID; receivers must deduplicate it. See NOTIFICATIONS.md. No real destination has been contacted during development. The audit table remains an application audit log, not cryptographically immutable storage.
 
 ## Required deployment checks
 

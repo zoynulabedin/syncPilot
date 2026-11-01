@@ -1,37 +1,50 @@
 # SyncPilot implementation status
 
-Date: 2026-11-01 (Asia/Dhaka). Branch: codex/complete-syncpilot. Base: bdcc5ee.
+Date: 2026-11-02 (Asia/Dhaka). Branch: `codex/complete-syncpilot`. Feature milestone: `dc7ca9a`; foundation base: `bdcc5ee`.
 
-## Implemented
+## Implemented this milestone
 
-Verified owner pairing, tenant boundaries and staff access; checkpointed catalog, variant, location and inventory discovery; explicit GID mappings; field ownership policies; exact expiring dry runs and approvals; targeted product/price and authoritative inventory CAS writers; durable inbox/jobs, worker leases, single-writer locks, retry/dead-letter/conflict recovery; read-only reconciliation; operational UI, settings, in-app alerts, audit, encrypted sessions, readiness, CI, container and backup tooling.
+Searchable, paginated product/variant/location mappings and imported-resource suggestions; paginated job, receipt, plan, conflict, reconciliation and audit history; selected SEO title/description and variant SKU/taxability/inventory-policy adapters; owner-opted history retention; authenticated privacy receipts and uninstall erasure; optional durable operational webhook alerts; encrypted streaming backups and isolated restore drills; Coolify staging configuration and CI backup coverage.
 
-Shopify writes remain disabled. Events and schedules generate reviewable proposals rather than unattended write approval. No live Shopify product/stock mutation, production deployment, main merge or remote push was performed.
+Maintenance stages now fail independently with bounded retry cadence. A privacy/retention/alert failure cannot suppress job processing. Alert DNS lookup and HTTPS share one deadline, preventing an indefinitely stalled resolver or a late request after timeout.
+
+The existing core includes online owner identity, offline encrypted sessions, both-owner challenge pairing, tenant/staff access controls, checkpointed discovery, explicit GID mappings, field ownership, exact expiring dry runs, single-use approvals, targeted writes, inventory CAS/idempotency, durable jobs/leases/locks, conservative uncertain-outcome recovery and reconciliation.
+
+Code and configuration changes are in `app/`, `prisma/`, `scripts/`, `tests/`, `.github/workflows/check.yml`, `deploy/`, `docker-compose.production.yml`, `shopify.app.toml`, `.env.example` and `package.json`. Documentation records contracts, runbooks and release boundaries separately. The original untracked specification and nested checkout are preserved.
+
+## Store decision and live evidence
+
+The owner explicitly chose **Keep stores separate**. Both installations remain independent: no workspace pairing, no active policy, and both Shopify write switches are false. No live Shopify product/stock mutation, external alert delivery, production deployment, remote push or merge occurred.
+
+- Quickstart: authenticated owner UI and worker verified; a fresh read-only import completed with 17 products, 26 variants and 2 locations after the new fields and migrations were installed.
+- Rankup: its earlier read-only import is persisted as completed with 2 products, 13 variants and 1 location. Local metadata confirms its connection has no workspace.
+- Local metadata check: 0 pairs and 0 active policies. A store's catalog selector exposes its own installation while unpaired.
+- The expired development tunnel was replaced, and the embedded Quickstart preview renders again. Temporary tunnels must stay running and are not deployment hosting.
 
 ## Executed verification
 
-- TypeScript, ESLint and production build: PASS.
-- Unit tests: 53 PASS (integration cases are skipped in the separate unit run).
-- Fresh disposable PostgreSQL integration: 30 PASS, including a 10,000-product fixture, real database concurrency/approval/tenant checks, simulated inventory CAS, uncertain outcomes, cancellation and lifecycle revocation.
-- Built-server HTTP smoke: 3 PASS. Liveness/readiness, invalid-token rejection and forged webhook rejection are checked using synthetic credentials; these are not authenticated browser tests.
-- Prisma validation/generation and both forward migrations: PASS locally; migrations from an empty database also pass in integration tests.
-- Session encryption migration: 1 legacy local session encrypted without printing credentials. Adapter/authenticated-encryption persistence tests pass.
-- Local homepage, health, readiness and HTTPS tunnel health returned HTTP 200 in the recorded session. PostgreSQL 17/Redis were healthy and the separate worker reported writes disabled.
-- Local database backup and isolated restore rehearsal: PASS, with 2 applied migrations. The application database was not replaced. Offsite encrypted restore/token decryption acceptance is still required.
-- Dependency audit after targeted overrides: 0 high/critical findings; moderate findings remain.
-- Polaris/NavMenu validation: PASS for the generated components. Final authenticated browser navigation remains unverified because browser session inspection failed and desktop-app access was blocked.
-- Local Docker build: PASS.
+- TypeScript, ESLint, production build and whitespace checks: PASS.
+- Unit tests: **79 PASS**, including maintenance failure isolation and bounded DNS regressions.
+- Fresh disposable PostgreSQL 17 integration: **41 PASS**, including 10,000 products, tenant/concurrency/CAS/approval checks, selected-field writes, history pagination, privacy isolation and alert transition/retry behavior.
+- Built-server HTTP tests: **4 PASS**, including signed synthetic privacy acceptance and forged-webhook/auth rejection. These use synthetic credentials and are not live Shopify webhook acceptance.
+- Fresh migration/schema parity: PASS. All **5 migrations** are applied locally. The three new additive migrations were backed up and applied without replacing the application database.
+- Encrypted backup/restore drill: PASS using PostgreSQL 17 client programs in the local container. Five migrations and one synthetic encrypted session restored; session decryption succeeded and a wrong session key was rejected. The application database was not replaced.
+- Docker image `syncpilot:verified-20261102`: PASS.
+- Expanded query selections and literal SEO/variant mutation inputs: VALID against Admin GraphQL **2026-10**. No new access scope was added.
+- Earlier dependency audit: 0 high/critical findings; moderate findings remain. This was not rerun for the later script-only package changes.
 
-Evidence is in ignored local-check-results/final-*.log files. Test Shopify responses are synthetic and do not establish live-store acceptance.
+Evidence is in ignored `local-check-results/continued-*.log` and `preview-*.log`. CI is configured for these checks but has not run remotely. Local synthetic responses and schema validation do not establish live write acceptance.
 
-A final navigation regression fix separates the business `store` filter from Shopify’s reserved `shop` authentication parameter. Six loader-level tests cover paired-store selection, preserved actor context and third-store rejection.
+## Migrations, security and deployment impact
 
-## Outstanding scope and release gates
+Deploy all forward migrations before new application/worker code. Runtime write switches remain false. External alerting additionally requires an operator-configured HTTPS endpoint/host allowlist and owner opt-in; retention is also off by default. Backups require a separate recoverable backup key and the persistent session key on a trusted operator host with compatible PostgreSQL client tools. The application image does not contain those tools.
 
-The full master specification is incomplete. Both-owner live acceptance on Quickstart and rankup-ai.myshopify.com, real webhook delivery and explicitly approved small product/price/inventory pilots, merchant stock authority, staging hosting/domain/secrets, ingress limits, alerting, offsite restore and production sign-off remain.
+Product/variant updates retain a read-to-write concurrency gap because those Shopify APIs do not offer inventory-style CAS. Inventory remains authoritative-source mode only; no shared-pool safety claim is made. Privacy erasure preserves the other store's private catalog and sessions in integration tests. Production key management, monitoring and offsite recovery still require operational acceptance.
 
-Advanced creation/options/media/metafield/collection adapters, shared-pool allocation ledger, unattended mutation consent, external alert delivery, automatic retention/privacy operations, and full mapping-history pagination are not implemented. Product/price APIs also retain a documented read-to-write concurrency gap; inventory has API CAS.
+## Remaining scope and next action
 
-See RUNBOOK.md, PROJECT_AUDIT.md, API.md, SECURITY.md, SHOPIFY_CONTRACTS.md and DECISIONS.md. Do not label this production-ready or the whole specification complete.
+The full master specification is **incomplete**. Advanced product creation/options/media/metafield/collection adapters, shared-pool reservation/allocation, bounded unattended consent, broader role delegation, ingress/per-user rate limits and complete production acceptance remain. Policy selectors still cap at 50 policies and 20 recent previews; separate history pages paginate.
 
-The live Quickstart owner dashboard, pairing controls and worker heartbeat were verified after reconnecting the browser. A real read-only import exposed legacy CLI HOST injection missing from the worker; the shared URL resolver now handles development HOST and classifies initialization errors. Four URL configuration regressions were added. Live import retry evidence is recorded separately after verification.
+Next deployment input is the intended Coolify project/server and HTTPS staging domain, with credentials supplied through secret storage. Staging authentication, real signed Shopify event delivery, offsite encrypted restore, external receiver/monitoring acceptance and rollback rehearsal remain. Cross-store pairing and write pilots were intentionally not performed under the owner's current decision; reconsider them only if the owner later changes that decision and defines stock/field authority.
+
+See `REMAINING_WORK.md`, `COOLIFY_STAGING.md`, `API.md`, `SECURITY.md`, `SHOPIFY_CONTRACTS.md` and `RUNBOOK.md`. Do not label this production-ready or the whole specification complete.
