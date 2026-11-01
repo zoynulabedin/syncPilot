@@ -38,6 +38,27 @@ SyncPilot is a **custom-distribution embedded Shopify app** for authorized Shopi
 
 The sample Docker Compose database password is only for localhost development. For webhooks, use the default Cloudflare tunnel (do **not** use `--use-localhost`). `shopify app dev` requires a development store or Shopify Plus sandbox store, not a production customer store. Keep the terminal running while testing. Use a proper secret for staging/production. Never commit the real `.env`, tokens, or Shopify API secrets.
 
+## Windows local validation and collaboration
+
+After setting up the local `.env` (do not commit it):
+
+```powershell
+git checkout feat/syncpilot-foundation
+git pull origin feat/syncpilot-foundation
+powershell -ExecutionPolicy Bypass -File .\scripts\local-check.ps1
+```
+
+This runs `npm ci`, `prisma generate`, `prisma validate`, TypeScript type checking and the React Router production build. It creates `local-check-results/summary.txt` and step-specific stdout/stderr logs. The reports are gitignored.
+
+To include the database migration, start PostgreSQL and then run:
+
+```powershell
+docker compose up -d postgres
+powershell -ExecutionPolicy Bypass -File .\scripts\local-check.ps1 -SkipInstall -WithMigration
+```
+
+Share only `summary.txt` and sanitized failure logs. **Never share `.env`, Shopify tokens/secrets, database passwords, or raw customer data.** The script does not connect Shopify stores and it does not test actual synchronization. To test OAuth and the local tunnel, separately use `shopify app dev --store your-development-store.myshopify.com` in a development store.
+
 ## Shopify installation across two stores
 
 Custom-distribution apps can be installed on multiple stores in the **same Shopify Plus organization** (or eligible development stores). Install the same app separately in Store A and Store B using your Shopify custom installation link. Each install produces its own authenticated session. This does not authorize cross-store data access by itself. Store pairing needs explicit approval by authorized staff on both installations and must verify organization/store ownership before enabling sync.
