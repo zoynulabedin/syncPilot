@@ -11,7 +11,7 @@ Shopify writes remain disabled. Events and schedules generate reviewable proposa
 ## Executed verification
 
 - TypeScript, ESLint and production build: PASS.
-- Unit tests: 43 PASS (integration cases are skipped in the separate unit run).
+- Unit tests: 49 PASS (integration cases are skipped in the separate unit run).
 - Fresh disposable PostgreSQL integration: 30 PASS, including a 10,000-product fixture, real database concurrency/approval/tenant checks, simulated inventory CAS, uncertain outcomes, cancellation and lifecycle revocation.
 - Built-server HTTP smoke: 3 PASS. Liveness/readiness, invalid-token rejection and forged webhook rejection are checked using synthetic credentials; these are not authenticated browser tests.
 - Prisma validation/generation and both forward migrations: PASS locally; migrations from an empty database also pass in integration tests.
@@ -23,6 +23,8 @@ Shopify writes remain disabled. Events and schedules generate reviewable proposa
 - Local Docker build: PASS.
 
 Evidence is in ignored local-check-results/final-*.log files. Test Shopify responses are synthetic and do not establish live-store acceptance.
+
+A final navigation regression fix separates the business `store` filter from Shopify’s reserved `shop` authentication parameter. Six loader-level tests cover paired-store selection, preserved actor context and third-store rejection.
 
 ## Outstanding scope and release gates
 

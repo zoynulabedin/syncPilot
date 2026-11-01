@@ -25,7 +25,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     ]),
   ];
   const url = new URL(request.url);
-  const shop = url.searchParams.get("shop") || actor.shop;
+  const shop = url.searchParams.get("store") || actor.shop;
   if (!shops.includes(shop))
     throw new Response("Store access denied", { status: 403 });
   const q = (url.searchParams.get("q") || "").slice(0, 120);
@@ -128,7 +128,7 @@ export default function Inventory() {
     observedNow,
   } = useLoaderData<typeof loader>();
   const pageLink = (next: number) =>
-    `?${new URLSearchParams({ shop, q, location, page: String(next) })}`;
+    `?${new URLSearchParams({ store: shop, q, location, page: String(next) })}`;
   return (
     <Page
       title="Inventory monitor"
@@ -154,8 +154,8 @@ export default function Inventory() {
         description="Safety buffers and the authoritative source are configured in Sync Rules. Absolute writes always compare against a fresh target quantity."
       >
         <Form method="get" className="sp-search">
-          <Field name="shop" label="Store">
-            <select id="shop" name="shop" defaultValue={shop}>
+          <Field name="store" label="Store">
+            <select id="store" name="store" defaultValue={shop}>
               {shops.map((domain) => (
                 <option key={domain} value={domain}>
                   {domain}
