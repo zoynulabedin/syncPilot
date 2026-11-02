@@ -1,0 +1,1 @@
+ALTER TABLE "SyncPolicy" ADD COLUMN "syncVariants" BOOLEAN NOT NULL DEFAULT false;

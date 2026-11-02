@@ -1,9 +1,16 @@
 import type { HeadersFunction, LoaderFunctionArgs } from "react-router";
-import { Outlet, useLoaderData, useRouteError } from "react-router";
+import {
+  Outlet,
+  useLoaderData,
+  useNavigation,
+  useRouteError,
+} from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { AppProvider } from "@shopify/shopify-app-react-router/react";
+import { NavMenu } from "@shopify/app-bridge-react";
 
 import { authenticate } from "../shopify.server";
+import "../styles/app.css";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   await authenticate.admin(request);
@@ -14,13 +21,34 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
 export default function App() {
   const { apiKey } = useLoaderData<typeof loader>();
+  const navigation = useNavigation();
 
   return (
     <AppProvider apiKey={apiKey}>
-      <s-app-nav>
-        <s-link href="/app">Home</s-link>
-        <s-link href="/app/additional">Additional page</s-link>
-      </s-app-nav>
+      <NavMenu>
+        <a href="/app" rel="home">
+          Overview
+        </a>
+        <a href="/app/stores">Stores</a>
+        <a href="/app/products">Products</a>
+        <a href="/app/inventory">Inventory</a>
+        <a href="/app/stock-pools">Stock pools</a>
+        <a href="/app/catalog-plans">Catalog plans</a>
+        <a href="/app/mappings">Mappings</a>
+        <a href="/app/rules">Sync Rules</a>
+        <a href="/app/activity">Activity</a>
+        <a href="/app/conflicts">Conflicts & approvals</a>
+        <a href="/app/reconciliation">Reconciliation</a>
+        <a href="/app/settings">Settings & audit</a>
+        <a href="/app/help">Help</a>
+      </NavMenu>
+      {navigation.state !== "idle" && (
+        <div
+          className="sp-loading"
+          role="progressbar"
+          aria-label="Loading page"
+        />
+      )}
       <Outlet />
     </AppProvider>
   );

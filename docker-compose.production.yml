@@ -1,0 +1,94 @@
+x-app: &app
+  image: syncpilot:${IMAGE_TAG:-local}
+  build: .
+  restart: unless-stopped
+  environment: &environment
+    NODE_ENV: production
+    APP_ENV: ${APP_ENV:-staging}
+    PORT: 3000
+    DATABASE_URL: ${DATABASE_URL:?Set the internal PostgreSQL connection URL}
+    REDIS_URL: redis://redis:6379
+    SHOPIFY_API_KEY: ${SHOPIFY_API_KEY:?Set the staging Shopify app key}
+    SHOPIFY_API_SECRET: ${SHOPIFY_API_SECRET:?Set the staging Shopify app secret}
+    SHOPIFY_APP_URL: ${SHOPIFY_APP_URL:?Set the staging HTTPS app URL}
+    SCOPES: read_products,write_products,read_inventory,write_inventory,read_locations
+    SESSION_ENCRYPTION_KEY: ${SESSION_ENCRYPTION_KEY:?Set a persistent base64 32-byte key}
+    SYNC_WRITE_ENABLED: ${SYNC_WRITE_ENABLED:-false}
+    INVENTORY_WRITE_ENABLED: ${INVENTORY_WRITE_ENABLED:-false}
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+    ALERT_WEBHOOK_HOSTS: ${ALERT_WEBHOOK_HOSTS:-}
+    ALERT_WEBHOOK_TOKEN: ${ALERT_WEBHOOK_TOKEN:-}
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  web:
+    <<: *app
+    expose: ["3000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+  worker:
+    <<: *app
+    command: ["npm", "run", "worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      disable: true
+  migrate:
+    <<: *app
+    restart: "no"
+    command: ["npm", "run", "setup"]
+    healthcheck:
+      disable: true
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: syncpilot
+      POSTGRES_USER: syncpilot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a strong database password}
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U syncpilot -d syncpilot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: ["redisdata:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  pgdata:
+  redisdata:

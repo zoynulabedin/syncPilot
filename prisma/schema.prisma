@@ -1,34 +1,601 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
 generator client {
   provider = "prisma-client-js"
 }
 
-// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
-// enough when changing adapters.
-// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
 datasource db {
-  provider = "sqlite"
-  url      = "file:dev.sqlite"
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 model Session {
-  id            String    @id
-  shop          String
-  state         String
-  isOnline      Boolean   @default(false)
-  scope         String?
-  expires       DateTime?
-  accessToken   String
-  userId        BigInt?
-  firstName     String?
-  lastName      String?
-  email         String?
-  accountOwner  Boolean   @default(false)
-  locale        String?
-  collaborator  Boolean?  @default(false)
-  emailVerified Boolean?  @default(false)
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
   refreshToken        String?
   refreshTokenExpires DateTime?
+
+  @@index([shop])
+}
+
+model Workspace {
+  id          String           @id @default(cuid())
+  name        String
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  connections ShopConnection[]
+  members WorkspaceMember[]
+  pairs StorePair[]
+  policies SyncPolicy[]
+  productMappings ProductMapping[]
+  variantMappings VariantMapping[]
+  locationMappings LocationMapping[]
+  previews SyncPreview[]
+  reconciliationRuns ReconciliationRun[]
+  notificationSettings NotificationSetting[]
+  conflicts SyncConflict[]
+  state       String           @default("ACTIVE")
+  retentionDays Int            @default(90)
+  reconciliationMinutes Int    @default(360)
+  retentionEnabled Boolean @default(false)
+  lastRetentionAt DateTime?
+  operationalAlerts OperationalAlert[]
+  notificationDeliveries NotificationDelivery[]
+}
+
+model ShopConnection {
+  id            String     @id @default(cuid())
+  shopDomain    String     @unique
+  workspaceId   String?
+  workspace     Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+  status        String     @default("CONNECTED")
+  installedAt   DateTime   @default(now())
+  lastSeenAt    DateTime   @default(now())
+  uninstalledAt DateTime?
+  shopGid       String?
+  currency      String?
+  scopes        String?
+  verifiedAt    DateTime?
+  lastImportAt  DateTime?
+  lastError     String?
+
+  @@index([workspaceId])
+}
+
+// WARNING: An installed shop must not be attached to a workspace solely
+// because an admin enters its domain. Pairing requires both-shop authorization.
+model StorePairingRequest {
+  id               String    @id @default(cuid())
+  initiatingShop    String
+  destinationShop   String
+  state             String    @default("PENDING")
+  expiresAt         DateTime
+  verifiedAt        DateTime?
+  createdAt         DateTime  @default(now())
+  challengeHash     String?
+  attempts          Int       @default(0)
+  initiatingActor   String?
+  destinationActor  String?
+  initiatingApprovedAt DateTime?
+  destinationApprovedAt DateTime?
+  organizationConfirmed Boolean @default(false)
+  workspaceId       String?
+
+  @@index([initiatingShop, destinationShop])
+}
+
+model SyncPolicy {
+  id                  String   @id @default(cuid())
+  workspaceId         String
+  sourceShopDomain    String
+  targetShopDomain    String
+  direction           String   @default("ONE_WAY")
+  syncProduct         Boolean  @default(false)
+  syncPrices          Boolean  @default(false)
+  syncVariants        Boolean  @default(false)
+  syncInventory       Boolean  @default(false)
+  inventoryAuthority  String?
+  enabled             Boolean  @default(false)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  fields              String[] @default([])
+  buffer              Int      @default(0)
+  allowNegative       Boolean  @default(false)
+  inventoryMode       String   @default("DISABLED")
+  reconciliationMinutes Int    @default(360)
+  status              String   @default("DRAFT")
+  approvedBy          String?
+  approvedAt          DateTime?
+
+  @@index([workspaceId])
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+}
+
+model ProductMapping {
+  id                  String   @id @default(cuid())
+  workspaceId         String
+  sourceShopDomain    String
+  sourceProductGid    String
+  targetShopDomain    String
+  targetProductGid    String
+  verifiedAt          DateTime?
+  createdAt           DateTime @default(now())
+
+  @@unique([sourceShopDomain, sourceProductGid, targetShopDomain], map: "ProductMapping_source_target_unique")
+  @@unique([targetShopDomain, targetProductGid, sourceShopDomain], map: "ProductMapping_target_source_unique")
+  @@index([workspaceId])
+  @@index([workspaceId, createdAt, id])
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+}
+
+model VariantMapping {
+  id                   String   @id @default(cuid())
+  workspaceId          String
+  sourceShopDomain     String
+  sourceVariantGid     String
+  sourceInventoryGid   String?
+  targetShopDomain     String
+  targetVariantGid     String
+  targetInventoryGid   String?
+  verifiedAt           DateTime?
+  createdAt            DateTime @default(now())
+
+  @@unique([sourceShopDomain, sourceVariantGid, targetShopDomain], map: "VariantMapping_source_target_unique")
+  @@unique([targetShopDomain, targetVariantGid, sourceShopDomain], map: "VariantMapping_target_source_unique")
+  @@index([workspaceId])
+  @@index([workspaceId, createdAt, id])
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+}
+
+model LocationMapping {
+  id                 String   @id @default(cuid())
+  workspaceId        String
+  sourceShopDomain   String
+  sourceLocationGid  String
+  targetShopDomain   String
+  targetLocationGid  String
+  verifiedAt         DateTime?
+  createdAt          DateTime @default(now())
+
+  @@unique([sourceShopDomain, sourceLocationGid, targetShopDomain], map: "LocationMapping_source_target_unique")
+  @@unique([targetShopDomain, targetLocationGid, sourceShopDomain], map: "LocationMapping_target_source_unique")
+  @@index([workspaceId])
+  @@index([workspaceId, createdAt, id])
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+}
+
+model WebhookEvent {
+  id          String   @id @default(cuid())
+  shopDomain  String
+  deliveryId  String
+  topic       String
+  resourceId  String?
+  status      String   @default("RECEIVED")
+  receivedAt  DateTime @default(now())
+  processedAt DateTime?
+  attempts    Int       @default(0)
+  lastError   String?
+
+  @@unique([shopDomain, deliveryId])
+  @@index([shopDomain, receivedAt])
+  @@index([status, receivedAt])
+}
+
+model SyncJob {
+  id          String    @id @default(cuid())
+  workspaceId String
+  policyId    String
+  sourceShop  String
+  targetShop  String
+  eventId     String?
+  operation   String
+  status      String    @default("PENDING")
+  attempts    Int       @default(0)
+  lastError   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  completedAt DateTime?
+  syncAttempts SyncAttempt[]
+  previewId   String?
+  payload     Json?
+  idempotencyKey String? @unique
+  availableAt DateTime  @default(now())
+  leaseUntil  DateTime?
+  leaseOwner  String?
+  maxAttempts Int       @default(5)
+  startedAt   DateTime?
+
+  @@index([workspaceId, status, createdAt])
+  @@index([status, availableAt, leaseUntil])
+  @@index([previewId])
+  @@index([eventId])
+}
+
+model SyncConflict {
+  id          String    @id @default(cuid())
+  workspaceId String
+  jobId       String?
+  code        String
+  details     Json
+  status      String    @default("OPEN")
+  createdAt   DateTime  @default(now())
+  resolvedAt  DateTime?
+  policyId    String?
+  resourceId  String?
+  field       String?
+  sourceValue Json?
+  targetValue Json?
+  resolution  String?
+  resolvedBy  String?
+
+  @@index([workspaceId, status])
+  @@index([workspaceId, createdAt, id])
+  @@index([jobId, status])
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+}
+
+model WorkspaceMember {
+  id          String   @id @default(cuid())
+  workspaceId String
+  shopDomain  String
+  userId      String
+  role        String   @default("VIEWER")
+  status      String   @default("ACTIVE")
+  createdAt   DateTime @default(now())
+
+  @@unique([workspaceId, shopDomain, userId])
+  @@index([workspaceId, status])
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+}
+
+model StorePair {
+  id          String   @id @default(cuid())
+  workspaceId String
+  sourceShop  String
+  targetShop  String
+  status      String   @default("VERIFIED")
+  requestId   String   @unique
+  verifiedAt  DateTime @default(now())
+  revokedAt   DateTime?
+
+  @@unique([workspaceId, sourceShop, targetShop])
+  @@index([workspaceId, status])
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+}
+
+model CatalogSnapshot {
+  id          String   @id @default(cuid())
+  shopDomain  String
+  status      String   @default("RUNNING")
+  cursor      String?
+  products    Int      @default(0)
+  variants    Int      @default(0)
+  locations   Int      @default(0)
+  lastError   String?
+  startedAt   DateTime @default(now())
+  completedAt DateTime?
+
+  @@index([shopDomain, startedAt])
+}
+
+model ProductSnapshot {
+  id               String   @id @default(cuid())
+  shopDomain       String
+  productGid       String
+  title            String
+  status           String
+  handle           String
+  descriptionHtml  String   @default("")
+  vendor           String   @default("")
+  productType      String   @default("")
+  tags             String[] @default([])
+  currency         String?
+  data             Json
+  hash             String
+  shopifyUpdatedAt DateTime?
+  observedAt       DateTime @default(now())
+
+  @@unique([shopDomain, productGid])
+  @@index([shopDomain, title])
+}
+
+model VariantSnapshot {
+  id               String   @id @default(cuid())
+  shopDomain       String
+  variantGid       String
+  productGid       String
+  inventoryItemGid String?
+  sku              String?
+  barcode          String?
+  price            String
+  compareAtPrice   String?
+  options          Json
+  tracked          Boolean  @default(false)
+  data             Json
+  hash             String
+  observedAt       DateTime @default(now())
+
+  @@unique([shopDomain, variantGid])
+  @@index([shopDomain, productGid])
+  @@index([shopDomain, sku])
+}
+
+model LocationSnapshot {
+  id          String   @id @default(cuid())
+  shopDomain  String
+  locationGid String
+  name        String
+  isActive    Boolean  @default(true)
+  observedAt  DateTime @default(now())
+
+  @@unique([shopDomain, locationGid])
+}
+
+model InventorySnapshot {
+  id               String   @id @default(cuid())
+  shopDomain       String
+  inventoryItemGid String
+  locationGid      String
+  quantity         Int
+  observedAt       DateTime @default(now())
+
+  @@unique([shopDomain, inventoryItemGid, locationGid])
+  @@index([shopDomain, locationGid])
+}
+
+model SyncPreview {
+  id          String   @id @default(cuid())
+  workspaceId String
+  policyId    String
+  createdBy   String
+  sourceHash  String
+  targetHash  String
+  changes     Json
+  status      String   @default("PENDING")
+  expiresAt   DateTime
+  approvedBy  String?
+  approvedAt  DateTime?
+  createdAt   DateTime @default(now())
+
+  @@index([workspaceId, status, createdAt])
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+}
+
+model SyncAttempt {
+  id          String    @id @default(cuid())
+  jobId       String
+  attempt     Int
+  status      String
+  errorCode   String?
+  details     Json?
+  startedAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  job SyncJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@unique([jobId, attempt])
+}
+
+model ReconciliationRun {
+  id          String   @id @default(cuid())
+  workspaceId String
+  policyId    String
+  status      String   @default("PENDING")
+  findings    Json?
+  total       Int      @default(0)
+  drifted     Int      @default(0)
+  startedAt   DateTime @default(now())
+  completedAt DateTime?
+  createdBy   String
+
+  @@index([workspaceId, startedAt])
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+}
+
+model WorkerHeartbeat {
+  id      String   @id
+  seenAt  DateTime @default(now())
+  status  String
+  details Json?
+}
+
+model NotificationSetting {
+  id          String   @id @default(cuid())
+  workspaceId String   @unique
+  enabled     Boolean  @default(true)
+  failureThreshold Int @default(3)
+  lagMinutes  Int      @default(15)
+  externalEnabled Boolean @default(false)
+  lastEvaluatedAt DateTime?
+  updatedAt   DateTime @updatedAt
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+}
+
+model AuditEvent {
+  id           String   @id @default(cuid())
+  workspaceId  String?
+  shopDomain   String?
+  actor        String
+  action       String
+  resourceType String?
+  resourceId   String?
+  details      Json?
+  createdAt    DateTime @default(now())
+
+  @@index([workspaceId, createdAt])
+}
+
+// Only receipt metadata is stored; customer identities and raw webhook bodies are discarded.
+model PrivacyRequest {
+  id String @id @default(cuid())
+  deliveryKey String @unique
+  shopDomain String?
+  topic String
+  status String @default("PENDING")
+  outcome String?
+  receivedAt DateTime @default(now())
+  completedAt DateTime?
+
+  @@index([status, receivedAt])
+  @@index([shopDomain, receivedAt])
+}
+
+model OperationalAlert {
+  id String @id @default(cuid())
+  workspaceId String
+  kind String
+  active Boolean @default(false)
+  revision Int @default(0)
+  observedValue Int @default(0)
+  updatedAt DateTime @updatedAt
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  @@unique([workspaceId, kind])
+}
+
+model NotificationDelivery {
+  id String @id @default(cuid())
+  workspaceId String
+  dedupKey String @unique
+  payload Json
+  status String @default("PENDING")
+  attempts Int @default(0)
+  availableAt DateTime @default(now())
+  leaseUntil DateTime?
+  leaseOwner String?
+  errorCode String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deliveredAt DateTime?
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  @@index([status, availableAt, leaseUntil])
+  @@index([workspaceId, createdAt])
+}
+
+model AutomaticConsent {
+  id String @id @default(cuid())
+  workspaceId String
+  policyId String
+  fingerprint String
+  approvedBy String
+  fields String[]
+  status String @default("ACTIVE")
+  expiresAt DateTime
+  intervalMinutes Int
+  maxJobs Int
+  maxChanges Int
+  perRunChanges Int
+  usedJobs Int @default(0)
+  usedChanges Int @default(0)
+  nextRunAt DateTime @default(now())
+  createdAt DateTime @default(now())
+  revokedAt DateTime?
+  @@index([status, nextRunAt])
+  @@index([workspaceId, createdAt])
+}
+
+model StockPool {
+  id String @id @default(cuid())
+  workspaceId String
+  reference String
+  name String
+  physical Int
+  reserved Int @default(0)
+  safetyBuffer Int @default(0)
+  version Int @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  allocations StockAllocation[]
+  reservations StockReservation[]
+  operations StockLedgerOperation[]
+  @@unique([workspaceId, reference])
+  @@index([workspaceId, createdAt, id])
+}
+
+model StockAllocation {
+  id String @id @default(cuid())
+  poolId String
+  shopDomain String
+  inventoryItemGid String
+  locationGid String
+  quantity Int @default(0)
+  pool StockPool @relation(fields: [poolId], references: [id], onDelete: Cascade)
+  reservations StockReservation[]
+  @@unique([shopDomain, inventoryItemGid, locationGid])
+  @@index([poolId])
+}
+
+model StockReservation {
+  id String @id @default(cuid())
+  poolId String
+  allocationId String
+  reference String
+  quantity Int
+  status String @default("ACTIVE")
+  createdAt DateTime @default(now())
+  completedAt DateTime?
+  pool StockPool @relation(fields: [poolId], references: [id], onDelete: Cascade)
+  allocation StockAllocation @relation(fields: [allocationId], references: [id], onDelete: Cascade)
+  @@unique([poolId, reference])
+  @@index([poolId, status])
+}
+
+model StockLedgerOperation {
+  id String @id @default(cuid())
+  poolId String
+  operationKey String
+  requestHash String
+  kind String
+  result Json
+  createdAt DateTime @default(now())
+  pool StockPool @relation(fields: [poolId], references: [id], onDelete: Cascade)
+  @@unique([poolId, operationKey])
+  @@index([poolId, createdAt, id])
+}
+
+model RequestRateLimit {
+  key String @id
+  count Int
+  expiresAt DateTime
+  @@index([expiresAt])
+}
+
+model CatalogOperation {
+  id String @id @default(cuid())
+  shopDomain String
+  createdBy String
+  kind String
+  input Json
+  precondition Json
+  stateHash String
+  status String @default("PENDING")
+  stage Int @default(0)
+  result Json?
+  approvedBy String?
+  approvedAt DateTime?
+  expiresAt DateTime
+  lastError String?
+  createdAt DateTime @default(now())
+  completedAt DateTime?
+  @@index([shopDomain, createdAt])
 }
