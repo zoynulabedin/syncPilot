@@ -9,7 +9,7 @@ import {
 import { useEffect } from "react";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
-import { requireActor } from "../services/authorization.server";
+import { canOperate, requireActor } from "../services/authorization.server";
 import { getWorkspace } from "../services/control-plane.server";
 import { importCatalog } from "../services/catalog.server";
 import {
@@ -107,7 +107,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     page,
     q,
     status,
-    canManage: actor.role === "OWNER",
+    canManage: await canOperate(actor),
   };
 }
 

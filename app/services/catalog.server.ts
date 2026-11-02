@@ -18,6 +18,7 @@ import {
 } from "../domain/sync-operations";
 import {
   currentConnection,
+  requireOperator,
   requireOwner,
   requirePairAccess,
   type Actor,
@@ -77,11 +78,13 @@ const json = (value: unknown) => value as Prisma.InputJsonValue;
 
 /** Enqueue durable discovery. Ownership/pairing is checked before any other shop can be read. */
 export async function importCatalog(actor: Actor, shopDomain = actor.shop) {
-  requireOwner(actor);
+  if (actor.role === "OWNER") requireOwner(actor);
+  else await requireOperator(actor);
   const shop = normalizeShop(shopDomain);
   const own = await currentConnection(actor);
   if (shop !== actor.shop) await requirePairAccess(actor, shop);
   return prisma.$transaction(async (tx) => {
+    if (actor.role !== "OWNER") await requireOperator(actor, tx);
     await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`catalog:${shop}`}))::text`;
     const queued = await tx.syncJob.findFirst({
       where: {

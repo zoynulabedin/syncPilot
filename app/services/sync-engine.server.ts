@@ -38,6 +38,7 @@ import {
 } from "./catalog.server";
 import { shopifyRequest } from "./shopify-client.server";
 import { logger } from "./logger.server";
+import { assertJobConsent, processAutomaticPreview } from "./automatic-sync.server";
 
 type Database = PrismaClient | Prisma.TransactionClient;
 const toJson = (value: unknown) => value as Prisma.InputJsonValue;
@@ -381,7 +382,7 @@ export async function buildPreview(policyId: string) {
   ]);
   return buildSyncPreview(policy, maps, source, target);
 }
-async function buildLivePreview(
+export async function buildLivePreview(
   policyId: string,
   progress: () => Promise<void> = async () => {},
 ) {
@@ -506,6 +507,7 @@ async function executeGroup(
           "This job was cancelled or its worker lease expired.",
         );
       await policyContext(policy.id, true, tx);
+      await assertJobConsent(job, tx);
       const approval = await tx.syncPreview.findFirst({
         where: {
           id: job.previewId ?? "",
@@ -589,6 +591,7 @@ async function executeGroup(
             "The job was cancelled or its worker lease expired.",
           );
         await policyContext(policy.id, true, tx);
+      await assertJobConsent(job, tx);
         const exactApproval = await tx.syncPreview.findFirst({
           where: {
             id: job.previewId ?? "",
@@ -802,6 +805,7 @@ async function executeGroup(
 }
 
 async function applyPreview(job: SyncJob, workerId: string) {
+  await assertJobConsent(job);
   const previewId = job.previewId ?? payloadObject(job.payload).previewId;
   if (typeof previewId !== "string")
     throw new SyncError(
@@ -1309,7 +1313,9 @@ export async function runWorkerOnce(workerId = workerIdentity) {
       await executeCatalogImport(id, job.sourceShop, () =>
         renew(job, workerId),
       );
-    } else if (job.operation === "APPLY_PREVIEW")
+    } else if (job.operation === "AUTO_PREVIEW")
+      await processAutomaticPreview(job, () => renew(job, workerId));
+    else if (job.operation === "APPLY_PREVIEW")
       await applyPreview(job, workerId);
     else if (job.operation === "RECONCILE") await reconcile(job, workerId);
     else if (job.operation === "WEBHOOK_REFRESH")

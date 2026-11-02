@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createWorkerCycle } from "./lib/worker-cycle";
 import prisma from "../app/db.server";
 import { logger } from "../app/services/logger.server";
+import { scheduleAutomaticSync } from "../app/services/automatic-sync.server";
 import { cleanHistory } from "../app/services/retention.server";
 import { processPrivacyRequests } from "../app/services/privacy.server";
 import {
@@ -26,6 +27,7 @@ const pause = (ms: number) =>
 const runCycle = createWorkerCycle({
   maintenance: [
     { stage: "RECONCILIATION", run: scheduleReconciliations },
+    { stage: "AUTOMATIC_SYNC", run: scheduleAutomaticSync },
     { stage: "PRIVACY", run: processPrivacyRequests },
     { stage: "RETENTION", run: cleanHistory },
     { stage: "ALERT_SCHEDULING", run: scheduleNotifications },

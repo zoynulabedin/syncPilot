@@ -491,3 +491,111 @@ model NotificationDelivery {
   @@index([status, availableAt, leaseUntil])
   @@index([workspaceId, createdAt])
 }
+
+model AutomaticConsent {
+  id String @id @default(cuid())
+  workspaceId String
+  policyId String
+  fingerprint String
+  approvedBy String
+  fields String[]
+  status String @default("ACTIVE")
+  expiresAt DateTime
+  intervalMinutes Int
+  maxJobs Int
+  maxChanges Int
+  perRunChanges Int
+  usedJobs Int @default(0)
+  usedChanges Int @default(0)
+  nextRunAt DateTime @default(now())
+  createdAt DateTime @default(now())
+  revokedAt DateTime?
+  @@index([status, nextRunAt])
+  @@index([workspaceId, createdAt])
+}
+
+model StockPool {
+  id String @id @default(cuid())
+  workspaceId String
+  reference String
+  name String
+  physical Int
+  reserved Int @default(0)
+  safetyBuffer Int @default(0)
+  version Int @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  allocations StockAllocation[]
+  reservations StockReservation[]
+  operations StockLedgerOperation[]
+  @@unique([workspaceId, reference])
+  @@index([workspaceId, createdAt, id])
+}
+
+model StockAllocation {
+  id String @id @default(cuid())
+  poolId String
+  shopDomain String
+  inventoryItemGid String
+  locationGid String
+  quantity Int @default(0)
+  pool StockPool @relation(fields: [poolId], references: [id], onDelete: Cascade)
+  reservations StockReservation[]
+  @@unique([shopDomain, inventoryItemGid, locationGid])
+  @@index([poolId])
+}
+
+model StockReservation {
+  id String @id @default(cuid())
+  poolId String
+  allocationId String
+  reference String
+  quantity Int
+  status String @default("ACTIVE")
+  createdAt DateTime @default(now())
+  completedAt DateTime?
+  pool StockPool @relation(fields: [poolId], references: [id], onDelete: Cascade)
+  allocation StockAllocation @relation(fields: [allocationId], references: [id], onDelete: Cascade)
+  @@unique([poolId, reference])
+  @@index([poolId, status])
+}
+
+model StockLedgerOperation {
+  id String @id @default(cuid())
+  poolId String
+  operationKey String
+  requestHash String
+  kind String
+  result Json
+  createdAt DateTime @default(now())
+  pool StockPool @relation(fields: [poolId], references: [id], onDelete: Cascade)
+  @@unique([poolId, operationKey])
+  @@index([poolId, createdAt, id])
+}
+
+model RequestRateLimit {
+  key String @id
+  count Int
+  expiresAt DateTime
+  @@index([expiresAt])
+}
+
+model CatalogOperation {
+  id String @id @default(cuid())
+  shopDomain String
+  createdBy String
+  kind String
+  input Json
+  precondition Json
+  stateHash String
+  status String @default("PENDING")
+  stage Int @default(0)
+  result Json?
+  approvedBy String?
+  approvedAt DateTime?
+  expiresAt DateTime
+  lastError String?
+  createdAt DateTime @default(now())
+  completedAt DateTime?
+  @@index([shopDomain, createdAt])
+}

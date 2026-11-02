@@ -32,8 +32,11 @@ export default function App() {
         <a href="/app/stores">Stores</a>
         <a href="/app/products">Products</a>
         <a href="/app/inventory">Inventory</a>
+        <a href="/app/stock-pools">Stock pools</a>
+        <a href="/app/catalog-plans">Catalog plans</a>
         <a href="/app/mappings">Mappings</a>
         <a href="/app/rules">Sync Rules</a>
+        <a href="/app/automatic-sync">Automatic sync</a>
         <a href="/app/activity">Activity</a>
         <a href="/app/conflicts">Conflicts & approvals</a>
         <a href="/app/reconciliation">Reconciliation</a>

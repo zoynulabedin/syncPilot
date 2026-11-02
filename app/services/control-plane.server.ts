@@ -5,6 +5,7 @@ import {
   type Actor,
   currentConnection,
   requireOwner,
+  requireOperator,
   requirePairAccess,
   requireWorkspace,
 } from "./authorization.server";
@@ -640,6 +641,10 @@ async function requirePaused(tx: Tx, workspaceId: string) {
     );
 }
 async function invalidatePlans(tx: Tx, workspaceId: string, policyId?: string) {
+  await tx.automaticConsent.updateMany({
+    where: { workspaceId, ...(policyId ? { policyId } : {}), status: "ACTIVE" },
+    data: { status: "REVOKED", revokedAt: new Date() },
+  });
   await tx.syncPreview.updateMany({
     where: {
       workspaceId,
@@ -1049,13 +1054,13 @@ export async function getPolicies(actor: Actor) {
     previews,
     connections: context?.connections ?? [await currentConnection(actor)],
     canManage: actor.role === "OWNER",
+    canOperate: actor.role === "OWNER" || context?.role === "OPERATOR",
     ...flags(),
   };
 }
 
 export async function previewPolicy(actor: Actor, policyId: string) {
-  requireOwner(actor);
-  const context = await requireWorkspace(actor);
+  const context = await requireOperator(actor);
   const policy = await prisma.syncPolicy.findFirst({
     where: { id: policyId, workspaceId: context.workspaceId },
   });
@@ -1066,7 +1071,7 @@ export async function previewPolicy(actor: Actor, policyId: string) {
   const { buildPreview } = await import("./sync-engine.server");
   const preview = await buildPreview(policy.id);
   return serial(async (tx) => {
-    await requireWorkspace(actor, tx);
+    await requireOperator(actor, tx);
     const latest = await tx.syncPolicy.findFirst({
       where: { id: policy.id, workspaceId: context.workspaceId },
     });
@@ -1421,6 +1426,7 @@ export async function getOperations(
     },
     heartbeats,
     canManage: actor.role === "OWNER",
+    canOperate: actor.role === "OWNER" || context?.role === "OPERATOR",
   };
 }
 async function ownedJob(actor: Actor, jobId: string, tx: Tx) {
@@ -1562,15 +1568,14 @@ export async function resolveConflict(actor: Actor, input: unknown) {
   });
 }
 export async function requestReconciliation(actor: Actor, policyId: string) {
-  requireOwner(actor);
-  const context = await requireWorkspace(actor);
+  const context = await requireOperator(actor);
   const policy = await prisma.syncPolicy.findFirst({
     where: { id: policyId, workspaceId: context.workspaceId },
   });
   if (!policy)
     throw new DomainError("POLICY_NOT_FOUND", "Policy not found.", 404);
   return serial(async (tx) => {
-    await requireWorkspace(actor, tx);
+    await requireOperator(actor, tx);
     const run = await tx.reconciliationRun.create({
       data: {
         workspaceId: context.workspaceId,
@@ -1786,12 +1791,12 @@ export async function getMembers(actor: Actor) {
   return {
     members: context
       ? await prisma.workspaceMember.findMany({
-          where: { workspaceId: context.workspaceId },
+          where: { workspaceId: context.workspaceId, shopDomain: actor.shop },
           orderBy: { createdAt: "asc" },
           take: 100,
         })
       : [],
-    connections: context?.connections ?? [await currentConnection(actor)],
+    connections: [await currentConnection(actor)],
     canManage: actor.role === "OWNER",
   };
 }
@@ -1801,7 +1806,7 @@ export async function setMember(actor: Actor, input: unknown) {
     .object({
       shopDomain: z.string(),
       userId: z.string().regex(/^[1-9][0-9]{0,24}$/),
-      role: z.literal("VIEWER"),
+      role: z.enum(["VIEWER", "OPERATOR"]),
       status: z.enum(["ACTIVE", "REVOKED"]),
     })
     .strict()
@@ -1824,6 +1829,8 @@ export async function setMember(actor: Actor, input: unknown) {
         "Store-owner authority is managed by Shopify and cannot be changed here.",
         403,
       );
+    if (shopDomain !== actor.shop)
+      throw new DomainError("STAFF_STORE_AUTHORITY", "Only the owner of this store can manage its staff access.", 403);
     const member = await tx.workspaceMember.upsert({
       where: {
         workspaceId_shopDomain_userId: {
@@ -1836,10 +1843,10 @@ export async function setMember(actor: Actor, input: unknown) {
         workspaceId: context.workspaceId,
         shopDomain,
         userId: data.userId,
-        role: "VIEWER",
+        role: data.role,
         status: data.status,
       },
-      update: { role: "VIEWER", status: data.status },
+      update: { role: data.role, status: data.status },
     });
     await audit(
       tx,
@@ -1848,7 +1855,7 @@ export async function setMember(actor: Actor, input: unknown) {
       "WorkspaceMember",
       member.id,
       context.workspaceId,
-      { shopDomain, userId: data.userId, role: "VIEWER", status: data.status },
+      { shopDomain, userId: data.userId, role: data.role, status: data.status },
     );
     return member;
   });

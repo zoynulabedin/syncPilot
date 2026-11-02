@@ -75,12 +75,15 @@ export async function action({ request }: ActionFunctionArgs) {
       });
     } else if (intent === "member") {
       const status = textField(form, "status");
+      const role = textField(form, "role");
       if (status !== "ACTIVE" && status !== "REVOKED")
         return { error: "Choose an access state." };
+      if (role !== "VIEWER" && role !== "OPERATOR")
+        return { error: "Choose a staff role." };
       await setMember(actor, {
         shopDomain: textField(form, "shopDomain"),
         userId: textField(form, "userId"),
-        role: "VIEWER",
+        role,
         status,
       });
     } else return { error: "Choose a valid settings action." };
@@ -301,7 +304,7 @@ export default function Settings() {
           {canManage && (
             <Section
               title="Staff access"
-              description="Shopify verifies store owners. Owners can grant a Shopify staff identity read-only workspace access."
+              description="Manage staff from your own store. Viewers inspect workspace data; operators can also import catalogs and prepare dry runs or comparisons. Store owners alone approve writes, change policies or mappings, and manage access."
             >
               <Table headings={["Store", "Shopify user ID", "Role", "State"]}>
                 {members.map((member) => (
@@ -335,7 +338,17 @@ export default function Settings() {
                       required
                     />
                   </Field>
-                  <Field name="status" label="Read-only access">
+                  <Field name="role" label="Staff role">
+                    <select id="role" name="role" defaultValue="VIEWER">
+                      <option value="VIEWER">
+                        Viewer — inspect workspace data
+                      </option>
+                      <option value="OPERATOR">
+                        Operator — prepare imports and comparisons
+                      </option>
+                    </select>
+                  </Field>
+                  <Field name="status" label="Access state">
                     <select id="status" name="status">
                       <option value="ACTIVE">Grant access</option>
                       <option value="REVOKED">Revoke access</option>

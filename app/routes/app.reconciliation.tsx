@@ -8,7 +8,7 @@ import {
 } from "react-router";
 import { authenticate } from "../shopify.server";
 import { Pagination } from "../components/list-navigation";
-import { requireActor } from "../services/authorization.server";
+import { canOperate, requireActor } from "../services/authorization.server";
 import {
   getOperations,
   getPolicies,
@@ -38,7 +38,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     getOperations(actor, new URL(request.url).searchParams),
     getPolicies(actor),
   ]);
-  return { ...operations, policies };
+  return { ...operations, policies, canManage: await canOperate(actor) };
 }
 export async function action({ request }: ActionFunctionArgs) {
   const actor = requireActor(await authenticate.admin(request));

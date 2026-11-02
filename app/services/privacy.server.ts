@@ -156,6 +156,8 @@ export async function processPrivacyRequest(id: string) {
       await tx.productMapping.deleteMany({ where: workspace });
       await tx.variantMapping.deleteMany({ where: workspace });
       await tx.locationMapping.deleteMany({ where: workspace });
+      await tx.automaticConsent.deleteMany({ where: workspace });
+      await tx.stockPool.deleteMany({ where: workspace });
       await tx.syncPolicy.deleteMany({ where: workspace });
       await tx.storePair.deleteMany({ where: workspace });
       await tx.workspaceMember.deleteMany({ where: workspace });
@@ -171,6 +173,7 @@ export async function processPrivacyRequest(id: string) {
       await tx.productSnapshot.deleteMany({ where: { shopDomain: shop } });
       await tx.locationSnapshot.deleteMany({ where: { shopDomain: shop } });
       await tx.catalogSnapshot.deleteMany({ where: { shopDomain: shop } });
+      await tx.catalogOperation.deleteMany({ where: { shopDomain: shop } });
       await tx.webhookEvent.deleteMany({ where: { shopDomain: shop } });
       await tx.session.deleteMany({ where: { shop } });
       await tx.shopConnection.deleteMany({ where: { shopDomain: shop } });

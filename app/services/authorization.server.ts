@@ -4,6 +4,7 @@ import { DomainError, normalizeShop } from "../domain/guards";
 
 type Database = PrismaClient | Prisma.TransactionClient;
 export type Actor = { shop: string; userId: string; role: "OWNER" | "VIEWER" };
+export type WorkspaceRole = "OWNER" | "OPERATOR" | "VIEWER";
 type AuthResult = {
   session: {
     shop: string;
@@ -84,7 +85,13 @@ export async function requireWorkspace(actor: Actor, db: Database = prisma) {
       },
     },
   });
-  if (actor.role !== "OWNER" && (!member || member.status !== "ACTIVE"))
+  if (
+    actor.role !== "OWNER" &&
+    (!member ||
+      member.status !== "ACTIVE" ||
+      !["VIEWER", "OPERATOR"].includes(member.role) ||
+      actor.userId === "unknown")
+  )
     throw new DomainError(
       "MEMBERSHIP_REQUIRED",
       "A workspace owner must grant access to this staff account.",
@@ -120,7 +127,31 @@ export async function requireWorkspace(actor: Actor, db: Database = prisma) {
       "The verified pair no longer matches this workspace.",
       403,
     );
-  return { workspaceId, workspace, connection, connections, pair };
+  const role: WorkspaceRole =
+    actor.role === "OWNER"
+      ? "OWNER"
+      : member?.role === "OPERATOR"
+        ? "OPERATOR"
+        : "VIEWER";
+  return { workspaceId, workspace, connection, connections, pair, role };
+}
+
+/** Operators prepare read-only work. Shopify owner authority is never delegated. */
+export async function requireOperator(actor: Actor, db: Database = prisma) {
+  const context = await requireWorkspace(actor, db);
+  if (context.role === "VIEWER")
+    throw new DomainError(
+      "OPERATOR_REQUIRED",
+      "An owner must grant operator access before preparing imports or comparisons.",
+      403,
+    );
+  return context;
+}
+
+export async function canOperate(actor: Actor, db: Database = prisma) {
+  if (actor.role === "OWNER") return true;
+  const context = await requireWorkspace(actor, db);
+  return context.role === "OPERATOR";
 }
 export async function requirePairAccess(
   actor: Actor,
