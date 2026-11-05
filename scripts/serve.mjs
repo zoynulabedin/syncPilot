@@ -23,6 +23,26 @@ const port = Number(process.env.PORT) || 3000;
 
 const app = express();
 app.disable("x-powered-by");
+// Chunked framing lets a sender turn six bytes into an object the server has to
+// hold, with any method, on any route, and whether or not it reads the body: 14 MiB
+// of one-byte chunks took a route that reads nothing to 1 GiB, and 30 MiB took one
+// that reads to 2 GiB and stopped it answering. No real client sends that, so a body
+// gets 64 chunks and then one for every 256 bytes, and a request past that is
+// dropped. This comes first because the static files answer a GET without reading
+// it. It bounds one body, not memory: HTTP/1.1 pipelining of many small requests on
+// one connection still grows the process, and floods are left to the proxy.
+const FREE_BODY_CHUNKS = 64;
+const MIN_BODY_CHUNK_BYTES = 256;
+app.use((req, _res, next) => {
+  let chunks = 0,
+    bytes = 0;
+  req.on("data", (chunk) => {
+    bytes += chunk.length;
+    if (++chunks > FREE_BODY_CHUNKS + bytes / MIN_BODY_CHUNK_BYTES)
+      req.destroy();
+  });
+  next();
+});
 app.use(compression());
 app.use(
   path.posix.join(build.publicPath, "assets"),
@@ -48,25 +68,6 @@ app.use((req, res, next) => {
       "request",
     ),
   );
-  next();
-});
-// Chunked framing lets a sender turn six bytes into an object the server has to
-// hold, on any route and whether or not it reads the body: 14 MiB of one-byte chunks
-// took a route that reads nothing to 1 GiB, and 30 MiB took one that reads to 2 GiB
-// and stopped it answering. No real client sends that, so a body gets 64 chunks and
-// then one for every 256 bytes, and a request past that is dropped.
-const FREE_BODY_CHUNKS = 64;
-const MIN_BODY_CHUNK_BYTES = 256;
-app.use((req, _res, next) => {
-  if (req.method !== "GET" && req.method !== "HEAD") {
-    let chunks = 0,
-      bytes = 0;
-    req.on("data", (chunk) => {
-      bytes += chunk.length;
-      if (++chunks > FREE_BODY_CHUNKS + bytes / MIN_BODY_CHUNK_BYTES)
-        req.destroy();
-    });
-  }
   next();
 });
 app.all("*", createRequestHandler({ build, mode: process.env.NODE_ENV }));

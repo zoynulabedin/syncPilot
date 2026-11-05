@@ -14,6 +14,9 @@ const mocks = vi.hoisted(() => ({
   revoke: vi.fn(),
 }));
 vi.mock("../app/db.server", () => ({ default: mocks.prisma }));
+vi.mock("../app/services/database-clock.server", () => ({
+  databaseNow: async () => new Date(),
+}));
 vi.mock("../app/shopify.server", () => ({
   authenticate: { admin: mocks.auth },
 }));

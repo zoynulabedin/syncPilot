@@ -14,6 +14,15 @@ import {
 } from "../../app/services/control-plane.server";
 import { updateInstallationScopes } from "../../app/services/installation.server";
 import { action, loader } from "../../app/routes/app.stores";
+import {
+  HOUR,
+  SECOND,
+  SKEWS,
+  fromDatabase,
+  remaining,
+  restoreProcessClock,
+  skewProcessClock,
+} from "./clock-skew";
 
 const mocks = vi.hoisted(() => ({ request: vi.fn(), auth: vi.fn() }));
 vi.mock("../../app/services/shopify-client.server", () => ({
@@ -186,6 +195,37 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         ).status,
       ).toBe("PAUSED");
     });
+
+    it.each(SKEWS)(
+      "dates a scope change it finds by the database's clock, with this process an hour %s it",
+      async (_, direction) => {
+        const { a } = await paired();
+        mocks.request.mockResolvedValueOnce(answerFor(a.shop));
+        await verifyStore(a, a.shop);
+        skewProcessClock(direction * HOUR);
+        try {
+          mocks.request.mockResolvedValueOnce(
+            answerFor(a.shop, ["read_products"]),
+          );
+          await verifyStore(a, a.shop);
+        } finally {
+          restoreProcessClock();
+        }
+        // Not lost as older than the installation, and no newer than now.
+        expect(await audits(a.shop, "SCOPES_CHANGED")).toBe(1);
+        const found = await connection(a.shop);
+        expect(found.scopes).toBe("read_products");
+        expect(Math.abs(await remaining(found.scopesUpdatedAt))).toBeLessThan(
+          10 * SECOND,
+        );
+        // So a later change from Shopify still applies.
+        await expect(
+          updateInstallationScopes(a.shop, SCOPES, {
+            updatedAt: await fromDatabase(SECOND),
+          }),
+        ).resolves.toEqual({ applied: true });
+      },
+    );
 
     describe("scope changes still on their way", () => {
       const HOUR = 3_600_000;

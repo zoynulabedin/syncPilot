@@ -1,6 +1,7 @@
 import type { Prisma, ShopConnection } from "@prisma/client";
 import prisma from "../db.server";
 import { normalizeShop } from "../domain/guards";
+import { databaseNow } from "./database-clock.server";
 import { rejectWebhook } from "./webhook-verification.server";
 
 type Tx = Prisma.TransactionClient;
@@ -151,6 +152,7 @@ export async function revokeInstallation(
   const { triggeredAt, webhookId, eventId } = delivery;
   return prisma.$transaction(async (tx) => {
     const connection = await lockConnection(tx, shop);
+    const now = await databaseNow(tx);
     if (connection && triggeredAt) {
       // A repeat of the uninstall already handled. Moving uninstalledAt would
       // also make the erasure guard hold a redaction it has already received.
@@ -181,8 +183,8 @@ export async function revokeInstallation(
     }
     if (
       triggeredAt &&
-      (Date.now() - triggeredAt.getTime() > MAX_UNINSTALL_AGE_MS ||
-        triggeredAt.getTime() - Date.now() > MAX_CLOCK_SKEW_MS)
+      (now.getTime() - triggeredAt.getTime() > MAX_UNINSTALL_AGE_MS ||
+        triggeredAt.getTime() - now.getTime() > MAX_CLOCK_SKEW_MS)
     )
       throw rejectWebhook("WEBHOOK_DELIVERY_TIME_INVALID", {
         topic: "APP_UNINSTALLED",
@@ -192,7 +194,6 @@ export async function revokeInstallation(
     // Lifecycle cleanup is independent of the presence of an offline session:
     // Shopify may deliver an uninstall again after tokens have been removed.
     await tx.session.deleteMany({ where: { shop } });
-    const now = new Date();
     await tx.shopConnection.updateMany({
       where: { shopDomain: shop },
       data: {
@@ -246,7 +247,7 @@ export async function revokeInstallation(
       });
       await tx.storePair.updateMany({
         where: { workspaceId, status: "VERIFIED" },
-        data: { status: "REVOKED", revokedAt: new Date() },
+        data: { status: "REVOKED", revokedAt: now },
       });
       await tx.shopConnection.updateMany({
         where: { workspaceId },
@@ -297,7 +298,7 @@ export async function reactivateInstallation(shop: string) {
       !(await tx.session.count({ where: { shop } }))
     )
       return connection;
-    const now = new Date();
+    const now = await databaseNow(tx);
     await tx.auditEvent.create({
       data: {
         shopDomain: shop,
@@ -383,7 +384,10 @@ export async function updateInstallationScopes(
     await tx.session.updateMany({ where: { shop }, data: { scope } });
     await tx.shopConnection.updateMany({
       where: { shopDomain: shop },
-      data: { scopes: scope, scopesUpdatedAt: updatedAt ?? new Date() },
+      data: {
+        scopes: scope,
+        scopesUpdatedAt: updatedAt ?? (await databaseNow(tx)),
+      },
     });
     if (connection?.workspaceId)
       await pauseWriteAuthority(

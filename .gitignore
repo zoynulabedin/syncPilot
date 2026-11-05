@@ -39,3 +39,4 @@ backups/
 
 # Preserved nested checkout from an earlier layout; never track it as a gitlink
 /syncPilot/
+.neon

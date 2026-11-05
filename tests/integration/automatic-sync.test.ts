@@ -29,6 +29,14 @@ import {
   updateInstallationScopes,
 } from "../../app/services/installation.server";
 import { runWorkerOnce } from "../../app/services/sync-engine.server";
+import {
+  HOUR,
+  SKEWS,
+  fromDatabase,
+  remaining,
+  restoreProcessClock,
+  skewProcessClock,
+} from "./clock-skew";
 
 const changes = [
   {
@@ -200,7 +208,7 @@ async function reviewedPlan(f: Pair, policyId: string) {
   });
   return freshPlan(f, policyId);
 }
-function freshPlan(f: Pair, policyId: string) {
+async function freshPlan(f: Pair, policyId: string) {
   return prisma.syncPreview.create({
     data: {
       workspaceId: f.workspace.id,
@@ -209,7 +217,7 @@ function freshPlan(f: Pair, policyId: string) {
       sourceHash: "source-hash",
       targetHash: "target-hash",
       changes,
-      expiresAt: new Date(Date.now() + 15 * MINUTE),
+      expiresAt: await fromDatabase(15 * MINUTE),
     },
   });
 }
@@ -1144,6 +1152,208 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         grantAutomaticConsent(f.owner, grantInput(policyId, reviewed.id, 3)),
       ).rejects.toMatchObject({ code: "CONSENT_EXISTS" });
     });
+
+    describe.each(SKEWS)(
+      "with this process's clock an hour %s the database's",
+      (_, direction) => {
+        beforeEach(() => skewProcessClock(direction * HOUR));
+        afterEach(restoreProcessClock);
+
+        it("keeps a consent running until it expires and runs it when due", async () => {
+          const f = await pairFixture();
+          const { id: policyId } = await policy(f);
+          const running = await consent(f, policyId, {
+            nextRunAt: await fromDatabase(-MINUTE),
+            expiresAt: await fromDatabase(10 * MINUTE),
+          });
+          expect(await scheduleAutomaticSync()).toBe(1);
+          const after = await reload(running.id);
+          expect(after.status).toBe("ACTIVE");
+          const next = await remaining(after.nextRunAt);
+          expect(next).toBeGreaterThan(14 * MINUTE);
+          expect(next).toBeLessThanOrEqual(15 * MINUTE);
+        });
+        it("ends a consent when it expires", async () => {
+          const f = await pairFixture();
+          const { id: policyId } = await policy(f);
+          const lapsed = await consent(f, policyId, {
+            nextRunAt: await fromDatabase(-2 * MINUTE),
+            expiresAt: await fromDatabase(-MINUTE),
+          });
+          expect(await scheduleAutomaticSync()).toBe(0);
+          expect((await reload(lapsed.id)).status).toBe("EXPIRED");
+        });
+        it("does not start a run before it is due", async () => {
+          const f = await pairFixture();
+          const { id: policyId } = await policy(f);
+          await consent(f, policyId, {
+            nextRunAt: await fromDatabase(10 * MINUTE),
+            expiresAt: await fromDatabase(30 * MINUTE),
+          });
+          expect(await scheduleAutomaticSync()).toBe(0);
+        });
+        it("grants consent for its full duration, from a plan that is still valid", async () => {
+          const f = await pairFixture();
+          const { id: policyId } = await policy(f);
+          const reviewed = await reviewedPlan(f, policyId);
+          await prisma.syncPreview.update({
+            where: { id: reviewed.id },
+            data: { expiresAt: await fromDatabase(MINUTE) },
+          });
+          const granted = await grantAutomaticConsent(
+            f.owner,
+            grantInput(policyId, reviewed.id, 3),
+          );
+          const left = await remaining(granted.expiresAt);
+          expect(left).toBeGreaterThan(59 * MINUTE);
+          expect(left).toBeLessThanOrEqual(60 * MINUTE);
+          const page = await getAutomaticConsents(f.owner);
+          expect(page.previews.map(({ id }) => id)).toContain(reviewed.id);
+        });
+        it("refuses a grant from a plan that has expired", async () => {
+          const f = await pairFixture();
+          const { id: policyId } = await policy(f);
+          const reviewed = await reviewedPlan(f, policyId);
+          await prisma.syncPreview.update({
+            where: { id: reviewed.id },
+            data: { expiresAt: await fromDatabase(-MINUTE) },
+          });
+          await expect(
+            grantAutomaticConsent(
+              f.owner,
+              grantInput(policyId, reviewed.id, 3),
+            ),
+          ).rejects.toMatchObject({ code: "PREVIEW_REQUIRED" });
+          const page = await getAutomaticConsents(f.owner);
+          expect(page.previews.map(({ id }) => id)).not.toContain(reviewed.id);
+        });
+        it("lets a lapsed consent be replaced, and keeps a live one in place", async () => {
+          const f = await pairFixture();
+          const { id: policyId } = await policy(f);
+          const reviewed = await reviewedPlan(f, policyId);
+          const existing = await consent(f, policyId, {
+            nextRunAt: await fromDatabase(10 * MINUTE),
+            expiresAt: await fromDatabase(MINUTE),
+          });
+          await expect(
+            grantAutomaticConsent(
+              f.owner,
+              grantInput(policyId, reviewed.id, 3),
+            ),
+          ).rejects.toMatchObject({ code: "CONSENT_EXISTS" });
+          await prisma.automaticConsent.update({
+            where: { id: existing.id },
+            data: { expiresAt: await fromDatabase(-MINUTE) },
+          });
+          await expect(
+            grantAutomaticConsent(
+              f.owner,
+              grantInput(policyId, reviewed.id, 3),
+            ),
+          ).resolves.toMatchObject({ status: "ACTIVE" });
+        });
+        it("stops a run under consent when it expires, and lets it pass before", async () => {
+          const f = await pairFixture();
+          const { id: policyId } = await policy(f);
+          const reviewed = await reviewedPlan(f, policyId);
+          const granted = await grantAutomaticConsent(
+            f.owner,
+            grantInput(policyId, reviewed.id, 3),
+          );
+          const run: SyncJob = await inFlight(
+            f,
+            policyId,
+            "AUTO_PREVIEW",
+            "RUNNING",
+            granted.id,
+          );
+          await prisma.automaticConsent.update({
+            where: { id: granted.id },
+            data: { expiresAt: await fromDatabase(MINUTE) },
+          });
+          await expect(assertJobConsent(run)).resolves.toMatchObject({
+            id: granted.id,
+          });
+          await prisma.automaticConsent.update({
+            where: { id: granted.id },
+            data: { expiresAt: await fromDatabase(-MINUTE) },
+          });
+          await expect(assertJobConsent(run)).rejects.toMatchObject({
+            code: "CONSENT_REVOKED",
+          });
+        });
+        it("runs a live preview under its lease and bounds the plan by the database's clock", async () => {
+          const f = await pairFixture();
+          const { id: policyId } = await policy(f);
+          const reviewed = await reviewedPlan(f, policyId);
+          const granted = await grantAutomaticConsent(
+            f.owner,
+            grantInput(policyId, reviewed.id, 3),
+          );
+          const run = await prisma.syncJob.create({
+            data: {
+              workspaceId: f.workspace.id,
+              policyId,
+              sourceShop: f.sourceShop,
+              targetShop: f.targetShop,
+              operation: "AUTO_PREVIEW",
+              status: "RUNNING",
+              leaseOwner: "live-worker",
+              leaseUntil: await fromDatabase(MINUTE),
+              payload: { consentId: granted.id },
+            },
+          });
+          api.request.mockReset();
+          const titles: Record<string, string> = {
+            [changes[0].sourceId]: "New",
+            [changes[0].targetId]: "Old",
+          };
+          api.request.mockImplementation(
+            async (
+              shop: string,
+              doc: string,
+              variables: Record<string, unknown> = {},
+            ) => {
+              if (doc.includes("SyncPilotShop"))
+                return {
+                  shop: {
+                    id: `gid://shopify/Shop/${shop === f.sourceShop ? 1 : 2}`,
+                    currencyCode: "USD",
+                  },
+                };
+              return {
+                nodes: (variables.ids as string[]).map((id) =>
+                  titles[id] === undefined
+                    ? null
+                    : {
+                        id,
+                        title: titles[id],
+                        status: "ACTIVE",
+                        handle: "fixture",
+                        descriptionHtml: "<p>Fixture</p>",
+                        vendor: "Fixture",
+                        productType: "Fixture",
+                        tags: [],
+                        updatedAt: "2026-11-01T00:00:00Z",
+                      },
+                ),
+              };
+            },
+          );
+          await processAutomaticPreview(run, async () => {});
+          const plan = await prisma.syncPreview.findFirstOrThrow({
+            where: { policyId, status: "APPROVED" },
+          });
+          const left = await remaining(plan.expiresAt);
+          expect(left).toBeGreaterThan(14 * MINUTE);
+          expect(left).toBeLessThanOrEqual(15 * MINUTE);
+          await prisma.syncJob.updateMany({
+            where: { policyId, status: { in: ["PENDING", "RUNNING"] } },
+            data: { status: "CANCELLED", leaseOwner: null, leaseUntil: null },
+          });
+        });
+      },
+    );
 
     it("opening the page reactivates a reinstalled store instead of reporting it inactive", async () => {
       const f = await pairFixture();

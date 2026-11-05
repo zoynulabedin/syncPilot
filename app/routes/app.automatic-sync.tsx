@@ -7,6 +7,7 @@ import {
   grantAutomaticConsent,
   revokeAutomaticConsent,
 } from "../services/automatic-sync.server";
+import { databaseNow } from "../services/database-clock.server";
 import {
   readActionForm,
   actionFailure,
@@ -86,7 +87,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     ...(await getAutomaticConsents(
       requireActor(await authenticate.admin(request)),
     )),
-    observedNow: Date.now(),
+    observedNow: (await databaseNow()).getTime(),
   };
 }
 

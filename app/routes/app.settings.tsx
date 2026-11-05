@@ -4,6 +4,7 @@ import { authenticate } from "../shopify.server";
 import { Pagination } from "../components/list-navigation";
 import { operationalCounts } from "../services/notifications.server";
 import { requireActor } from "../services/authorization.server";
+import { databaseNow } from "../services/database-clock.server";
 import {
   getMembers,
   getOperations,
@@ -51,7 +52,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     auditPage: operations.pages.audit,
     heartbeats: operations.heartbeats,
     alerts,
-    observedNow: Date.now(),
+    observedNow: (await databaseNow()).getTime(),
   };
 }
 export async function action({ request }: ActionFunctionArgs) {

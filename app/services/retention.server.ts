@@ -1,15 +1,14 @@
 import { Prisma } from "@prisma/client";
 import prisma from "../db.server";
+import { databaseNow } from "./database-clock.server";
 
 const batch = 500;
 const day = 86_400_000;
 const window = { take: batch, select: { id: true } } as const;
 
 /** Bounded daily cleanup; owner consent is persisted and rechecked inside the transaction. */
-export async function cleanWorkspaceHistory(
-  workspaceId: string,
-  now = new Date(),
-) {
+export async function cleanWorkspaceHistory(workspaceId: string, at?: Date) {
+  const now = at ?? (await databaseNow());
   return prisma.$transaction(
     async (tx) => {
       const lock = await tx.$queryRaw<
@@ -166,7 +165,8 @@ export async function cleanWorkspaceHistory(
   );
 }
 
-export async function cleanHistory(now = new Date()) {
+export async function cleanHistory(at?: Date) {
+  const now = at ?? (await databaseNow());
   const workspaces = await prisma.workspace.findMany({
     where: {
       state: "ACTIVE",
@@ -184,6 +184,6 @@ export async function cleanHistory(now = new Date()) {
     select: { id: true },
   });
   for (const workspace of workspaces)
-    await cleanWorkspaceHistory(workspace.id, now);
+    await cleanWorkspaceHistory(workspace.id, at);
   return workspaces.length;
 }

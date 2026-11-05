@@ -3,6 +3,7 @@ import { Form, Link, useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
 import { requireActor } from "../services/authorization.server";
+import { databaseNow } from "../services/database-clock.server";
 import { getWorkspace } from "../services/control-plane.server";
 import {
   EmptyState,
@@ -109,7 +110,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     q,
     location,
     page,
-    observedNow: Date.now(),
+    observedNow: (await databaseNow()).getTime(),
   };
 }
 

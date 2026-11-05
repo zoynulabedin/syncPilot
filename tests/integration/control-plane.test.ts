@@ -1,4 +1,12 @@
-import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import prisma from "../../app/db.server";
 import type { Actor } from "../../app/services/authorization.server";
 import {
@@ -17,6 +25,7 @@ import {
   getOperations,
   getStores,
   initiatePairing,
+  previewPolicy,
   retryJob,
   saveMapping,
   savePolicy,
@@ -24,6 +33,16 @@ import {
   updatePolicy,
 } from "../../app/services/control-plane.server";
 import { buildPreview } from "../../app/services/sync-engine.server";
+import {
+  HOUR,
+  MINUTE,
+  SECOND,
+  SKEWS,
+  fromDatabase,
+  remaining,
+  restoreProcessClock,
+  skewProcessClock,
+} from "./clock-skew";
 
 const changes = [
   {
@@ -201,6 +220,172 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         }),
       ).rejects.toMatchObject({ code: "PAIRING_EXPIRED" });
     });
+    describe.each(SKEWS)(
+      "with the web process's clock an hour %s the database's",
+      (_, direction) => {
+        beforeEach(() => skewProcessClock(direction * HOUR));
+        afterEach(restoreProcessClock);
+        const paired = async () => {
+          const f = await fixture();
+          const policy = await savePolicy(f.a, policyData(f.a.shop, f.b.shop));
+          return { ...f, policy };
+        };
+        const reviewable = (
+          f: Awaited<ReturnType<typeof paired>>,
+          expiresAt: Date,
+        ) =>
+          prisma.syncPreview.create({
+            data: {
+              workspaceId: f.workspaceId,
+              policyId: f.policy.id,
+              createdBy: `${f.a.shop}:${f.a.userId}`,
+              sourceHash: "source-hash",
+              targetHash: "target-hash",
+              changes,
+              expiresAt,
+            },
+          });
+        const expiring = (id: string, expiresAt: Date) =>
+          prisma.storePairingRequest.update({
+            where: { id },
+            data: { expiresAt },
+          });
+
+        it("gives a pairing request its full 15 minutes", async () => {
+          const { pending } = await fixture(false);
+          const stored = await prisma.storePairingRequest.findUniqueOrThrow({
+            where: { id: pending.request.id },
+          });
+          const left = await remaining(stored.expiresAt);
+          expect(left).toBeGreaterThan(14 * MINUTE);
+          expect(left).toBeLessThanOrEqual(15 * MINUTE);
+        });
+        it("accepts a pairing request until it expires, and refuses it after", async () => {
+          const live = await fixture(false);
+          await expiring(live.pending.request.id, await fromDatabase(MINUTE));
+          await expect(
+            acceptPairing(live.b, {
+              requestId: live.pending.request.id,
+              challenge: live.pending.challenge,
+              organizationConfirmed: true,
+            }),
+          ).resolves.toBeDefined();
+          await expect(
+            confirmPairing(live.a, { requestId: live.pending.request.id }),
+          ).resolves.toBeDefined();
+          const lapsed = await fixture(false);
+          await expiring(
+            lapsed.pending.request.id,
+            await fromDatabase(-MINUTE),
+          );
+          await expect(
+            acceptPairing(lapsed.b, {
+              requestId: lapsed.pending.request.id,
+              challenge: lapsed.pending.challenge,
+              organizationConfirmed: true,
+            }),
+          ).rejects.toMatchObject({ code: "PAIRING_EXPIRED" });
+        });
+        it("counts a pairing request as pending exactly until it expires", async () => {
+          const { a, b, pending } = await fixture(false);
+          const again = {
+            destinationShop: b.shop,
+            organizationConfirmed: true,
+          };
+          await expiring(pending.request.id, await fromDatabase(MINUTE));
+          await expect(initiatePairing(a, again)).rejects.toMatchObject({
+            code: "PAIRING_PENDING",
+          });
+          await expiring(pending.request.id, await fromDatabase(-MINUTE));
+          await expect(initiatePairing(a, again)).resolves.toBeDefined();
+        });
+        it("gives a dry run's plan its full 15 minutes", async () => {
+          const f = await paired();
+          const plan = await previewPolicy(f.a, f.policy.id);
+          const left = await remaining(plan.expiresAt);
+          expect(left).toBeGreaterThan(14 * MINUTE);
+          expect(left).toBeLessThanOrEqual(15 * MINUTE);
+        });
+        it("activates and approves a plan until it expires, and refuses it after", async () => {
+          process.env.SYNC_WRITE_ENABLED = "true";
+          const f = await paired();
+          const plan = await reviewable(f, await fromDatabase(-MINUTE));
+          await expect(
+            updatePolicy(f.a, f.policy.id, "ACTIVATE"),
+          ).rejects.toMatchObject({ code: "PREVIEW_REQUIRED" });
+          await prisma.syncPreview.update({
+            where: { id: plan.id },
+            data: { expiresAt: await fromDatabase(MINUTE) },
+          });
+          await expect(
+            updatePolicy(f.a, f.policy.id, "ACTIVATE"),
+          ).resolves.toBeDefined();
+          await expect(approvePreview(f.a, plan.id)).resolves.toMatchObject({
+            operation: "APPLY_PREVIEW",
+          });
+          const lapsed = await reviewable(f, await fromDatabase(-MINUTE));
+          await expect(approvePreview(f.a, lapsed.id)).rejects.toMatchObject({
+            code: "PREVIEW_EXPIRED",
+          });
+        });
+        it("makes a retried job available at once, not after the skew", async () => {
+          const f = await paired();
+          const failed = await prisma.syncJob.create({
+            data: {
+              workspaceId: f.workspaceId,
+              policyId: "",
+              sourceShop: f.a.shop,
+              targetShop: f.a.shop,
+              operation: "CATALOG_IMPORT",
+              status: "FAILED",
+            },
+          });
+          const retried = await retryJob(f.a, failed.id);
+          const wait = await remaining(retried.availableAt);
+          expect(wait).toBeLessThanOrEqual(0);
+          expect(wait).toBeGreaterThan(-10 * SECOND);
+          await prisma.syncJob.update({
+            where: { id: failed.id },
+            data: { status: "CANCELLED" },
+          });
+        });
+        it("holds mapping changes for a running job until its lease runs out", async () => {
+          const f = await fixture();
+          await Promise.all([product(f.a.shop, 100), product(f.b.shop, 200)]);
+          const running = await prisma.syncJob.create({
+            data: {
+              workspaceId: f.workspaceId,
+              policyId: "",
+              sourceShop: f.a.shop,
+              targetShop: f.a.shop,
+              operation: "CATALOG_IMPORT",
+              status: "RUNNING",
+              leaseOwner: "live-worker",
+              leaseUntil: await fromDatabase(MINUTE),
+            },
+          });
+          const mapping = {
+            kind: "PRODUCT",
+            sourceShop: f.a.shop,
+            targetShop: f.b.shop,
+            sourceGid: "gid://shopify/Product/100",
+            targetGid: "gid://shopify/Product/200",
+          };
+          await expect(saveMapping(f.a, mapping)).rejects.toMatchObject({
+            code: "JOB_RUNNING",
+          });
+          await prisma.syncJob.update({
+            where: { id: running.id },
+            data: { leaseUntil: await fromDatabase(-SECOND) },
+          });
+          await expect(saveMapping(f.a, mapping)).resolves.toBeDefined();
+          await prisma.syncJob.update({
+            where: { id: running.id },
+            data: { status: "CANCELLED", leaseOwner: null, leaseUntil: null },
+          });
+        });
+      },
+    );
     it("denies unknown staff until a verified owner grants read-only membership", async () => {
       const { a, b } = await fixture();
       const staff: Actor = { shop: a.shop, userId: "404", role: "VIEWER" };

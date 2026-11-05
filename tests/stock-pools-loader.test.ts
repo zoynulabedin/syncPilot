@@ -4,6 +4,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // the test did not stub.
 const mocks = vi.hoisted(() => ({ prisma: {} as Record<string, unknown> }));
 vi.mock("../app/db.server", () => ({ default: mocks.prisma }));
+vi.mock("../app/services/database-clock.server", () => ({
+  databaseNow: async () => new Date(),
+}));
 import type { Actor } from "../app/services/authorization.server";
 import { getStockPools } from "../app/services/stock-ledger.server";
 

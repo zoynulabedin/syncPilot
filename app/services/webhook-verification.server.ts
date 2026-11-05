@@ -150,3 +150,29 @@ export function requireSignedShop(
   if (signed !== webhook.shop)
     throw rejectWebhook("WEBHOOK_SHOP_MISMATCH", webhook);
 }
+
+/**
+ * app/uninstalled only. Shopify's sample body has a null myshopify_domain, and
+ * refusing a real delivery shaped that way would lose every uninstall to retries,
+ * which is worse than the risk here: a revocation that pairing again undoes. A
+ * body that names a store still has to name this one. Erasure cannot be undone,
+ * so shop/redact and customers/* stay with requireSignedShop.
+ */
+export function requireUninstallShop(webhook: VerifiedWebhook) {
+  const body = webhook.payload;
+  if (typeof body === "object" && body !== null && !Array.isArray(body)) {
+    const named = (body as Record<string, unknown>).myshopify_domain;
+    if (named === null || named === undefined) {
+      logger.warn(
+        {
+          code: "WEBHOOK_SHOP_NOT_IN_BODY",
+          topic: webhook.topic,
+          shop: webhook.shop,
+        },
+        "Signed uninstall names no store; acting on the unsigned shop header",
+      );
+      return;
+    }
+  }
+  requireSignedShop(webhook, "myshopify_domain");
+}

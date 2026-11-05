@@ -29,6 +29,7 @@ import { stableHash, SyncError } from "../domain/sync";
 import { INSTALLATION_CHECK_QUERY } from "../domain/sync-operations";
 import { listPage } from "./listing.server";
 import { alertDestination } from "./alert-transport.server";
+import { databaseNow } from "./database-clock.server";
 import {
   reactivateInstallation,
   revokeStandingConsents,
@@ -98,7 +99,8 @@ export async function ensureInstallation(actor: Actor) {
   const connection = await prisma.shopConnection.upsert({
     where: { shopDomain: actor.shop },
     create: { shopDomain: actor.shop },
-    update: { lastSeenAt: new Date() },
+    // Later compared with Shopify's time for a delivery, so this one clock.
+    update: { lastSeenAt: await databaseNow() },
   });
   if (connection.status === "CONNECTED" && !connection.uninstalledAt)
     return connection;
@@ -164,7 +166,7 @@ export async function verifyStore(actor: Actor, shopDomain: string) {
       ({ handle }) => handle,
     );
     const scope = [...new Set(granted)].sort().join(",");
-    const verifiedAt = new Date();
+    const verifiedAt = await databaseNow();
     // A recorded set that changed is a scope change, with what that revokes.
     if (connection.scopes && connection.scopes !== scope)
       await updateInstallationScopes(shop, granted, {
@@ -264,10 +266,11 @@ export async function initiatePairing(actor: Actor, input: unknown) {
         "One of these stores is already paired. Disconnect it first.",
         409,
       );
+    const now = await databaseNow(tx);
     const pending = await tx.storePairingRequest.findFirst({
       where: {
         state: { in: ["PENDING", "ACCEPTED"] },
-        expiresAt: { gt: new Date() },
+        expiresAt: { gt: now },
         OR: [
           { initiatingShop: actor.shop },
           { destinationShop: actor.shop },
@@ -288,9 +291,9 @@ export async function initiatePairing(actor: Actor, input: unknown) {
         destinationShop,
         challengeHash: challengeHash(challenge),
         initiatingActor: actor.userId,
-        initiatingApprovedAt: new Date(),
+        initiatingApprovedAt: now,
         organizationConfirmed: true,
-        expiresAt: new Date(Date.now() + 15 * 60_000),
+        expiresAt: new Date(now.getTime() + 15 * 60_000),
       },
     });
     await audit(
@@ -326,7 +329,7 @@ export async function acceptPairing(actor: Actor, input: unknown) {
         "Pairing request not found.",
         404,
       );
-    assertPairingUsable(request);
+    assertPairingUsable(request, await databaseNow(tx));
     if (request.state !== "PENDING")
       throw new DomainError(
         "PAIRING_USED",
@@ -395,7 +398,7 @@ export async function confirmPairing(actor: Actor, input: unknown) {
         "Pairing request not found.",
         404,
       );
-    assertPairingUsable(request);
+    assertPairingUsable(request, await databaseNow(tx));
     if (
       request.state !== "ACCEPTED" ||
       !request.destinationApprovedAt ||
@@ -747,7 +750,7 @@ async function requirePaused(tx: Tx, workspaceId: string) {
       where: {
         workspaceId,
         status: { in: ["RUNNING", "PROCESSING"] },
-        leaseUntil: { gt: new Date() },
+        leaseUntil: { gt: await databaseNow(tx) },
       },
     })
   )
@@ -1216,7 +1219,7 @@ export async function previewPolicy(actor: Actor, policyId: string) {
         sourceHash: preview.sourceHash,
         targetHash: preview.targetHash,
         changes: json(preview.changes),
-        expiresAt: new Date(Date.now() + 15 * 60_000),
+        expiresAt: new Date((await databaseNow(tx)).getTime() + 15 * 60_000),
       },
     });
     await audit(
@@ -1256,7 +1259,7 @@ export async function updatePolicy(
           policyId,
           workspaceId: context.workspaceId,
           status: { in: ["PENDING", "APPROVED", "APPLIED"] },
-          expiresAt: { gt: new Date() },
+          expiresAt: { gt: await databaseNow(tx) },
         },
         orderBy: { createdAt: "desc" },
       });
@@ -1364,7 +1367,10 @@ export async function approvePreview(actor: Actor, previewId: string) {
   });
   if (!preview)
     throw new DomainError("PREVIEW_NOT_FOUND", "Preview not found.", 404);
-  if (preview.status !== "PENDING" || preview.expiresAt <= new Date())
+  if (
+    preview.status !== "PENDING" ||
+    preview.expiresAt <= (await databaseNow())
+  )
     throw new DomainError(
       "PREVIEW_EXPIRED",
       "This preview has expired or was already used. Run a fresh preview.",
@@ -1396,7 +1402,7 @@ export async function approvePreview(actor: Actor, previewId: string) {
         id: preview.id,
         workspaceId: freshContext.workspaceId,
         status: "PENDING",
-        expiresAt: { gt: new Date() },
+        expiresAt: { gt: await databaseNow(tx) },
       },
     });
     const policy = await tx.syncPolicy.findFirst({
@@ -1624,7 +1630,7 @@ export async function retryJob(actor: Actor, jobId: string) {
       where: { id: job.id },
       data: {
         status: "PENDING",
-        availableAt: new Date(),
+        availableAt: await databaseNow(tx),
         leaseUntil: null,
         leaseOwner: null,
         lastError: null,

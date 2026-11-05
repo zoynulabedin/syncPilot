@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 import prisma from "../../app/db.server";
-import { cleanWorkspaceHistory } from "../../app/services/retention.server";
+import {
+  cleanHistory,
+  cleanWorkspaceHistory,
+} from "../../app/services/retention.server";
 import {
   processPrivacyRequest,
   processPrivacyRequests,
@@ -16,6 +19,14 @@ import {
 } from "../../app/services/control-plane.server";
 import { revokeInstallation } from "../../app/services/installation.server";
 import type { Actor } from "../../app/services/authorization.server";
+import {
+  DAY,
+  HOUR,
+  SKEWS,
+  fromDatabase,
+  restoreProcessClock,
+  skewProcessClock,
+} from "./clock-skew";
 
 async function fixture() {
   const key = randomUUID().slice(0, 8);
@@ -309,6 +320,63 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         await prisma.productSnapshot.count({ where: { shopDomain: a.shop } }),
       ).toBe(0);
     });
+    describe.each(SKEWS)(
+      "with the worker's clock %s the database's",
+      (_, direction) => {
+        afterEach(restoreProcessClock);
+        it("waits out the 48 hours on the database's clock, three days of skew or not", async () => {
+          const { a } = await fixture();
+          await snapshot(a.shop);
+          await revokeInstallation(a.shop);
+          await receivePrivacyRequest(a.shop, "SHOP_REDACT", randomUUID());
+          const uninstalledFor = async (hours: number) =>
+            prisma.shopConnection.update({
+              where: { shopDomain: a.shop },
+              data: { uninstalledAt: await fromDatabase(-hours * HOUR) },
+            });
+          const kept = () =>
+            prisma.productSnapshot.count({ where: { shopDomain: a.shop } });
+          await uninstalledFor(1);
+          skewProcessClock(direction * 3 * DAY);
+          await processPrivacyRequests();
+          expect(await kept()).toBe(1);
+          await uninstalledFor(49);
+          await processPrivacyRequests();
+          expect(await kept()).toBe(0);
+        });
+        it("keeps a retention cutoff and its daily schedule on the database's clock, eight days of skew or not", async () => {
+          const { a, b, workspaceId } = await fixture();
+          await prisma.workspace.update({
+            where: { id: workspaceId },
+            data: { retentionEnabled: true, retentionDays: 7 },
+          });
+          const closed = async (ageDays: number) =>
+            prisma.syncJob.create({
+              data: {
+                workspaceId,
+                policyId: "",
+                sourceShop: a.shop,
+                targetShop: b.shop,
+                operation: "RECONCILE",
+                status: "SUCCEEDED",
+                updatedAt: await fromDatabase(-ageDays * DAY),
+              },
+            });
+          const recent = await closed(1);
+          const old = await closed(8);
+          const exists = async (id: string) =>
+            !!(await prisma.syncJob.findUnique({ where: { id } }));
+          skewProcessClock(direction * 8 * DAY);
+          await cleanHistory();
+          expect(await exists(recent.id)).toBe(true);
+          expect(await exists(old.id)).toBe(false);
+          // Ran just now on the database's clock, so it is not due again today.
+          const again = await closed(8);
+          await cleanHistory();
+          expect(await exists(again.id)).toBe(true);
+        });
+      },
+    );
     it("does not let requests waiting out the 48 hours keep a due one from being reached", async () => {
       const waiting = await fixture();
       const due = await fixture();

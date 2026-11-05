@@ -25,8 +25,14 @@ const FORGED_DELIVERY = {
 };
 const LOGIN_FORM = { "Content-Type": "application/x-www-form-urlencoded" };
 const KiB = 1024;
-const requestHead = (path: string, headers: Record<string, string>) =>
-  `POST ${path} HTTP/1.1\r\nHost: 127.0.0.1:3210\r\n${Object.entries(headers)
+const requestHead = (
+  path: string,
+  headers: Record<string, string>,
+  method = "POST",
+) =>
+  `${method} ${path} HTTP/1.1\r\nHost: 127.0.0.1:3210\r\n${Object.entries(
+    headers,
+  )
     .map(([name, value]) => `${name}: ${value}\r\n`)
     .join("")}\r\n`;
 /** A connection the test holds open, to see when the server gives up on it. */
@@ -346,23 +352,62 @@ test("stalled uploads are dropped at the deadline and never shut out small deliv
   expect(received.status()).toBe(200);
 });
 
-test("a body cut into tiny chunks ends the connection on any route, read or not", async () => {
+test("a body cut into tiny chunks ends the connection with any method on any route, read or not", async () => {
   // One byte a chunk: under every byte limit, and an object the server must hold.
   const tiny = "1\r\nx\r\n".repeat(20_000);
-  for (const route of [
-    "/webhooks/products/update",
-    "/auth/login",
-    "/health",
-    "/app",
+  for (const [method, route] of [
+    ["POST", "/webhooks/products/update"],
+    ["POST", "/auth/login"],
+    ["POST", "/health"],
+    ["POST", "/app"],
+    // A GET or HEAD can declare a body too, and nothing here reads one.
+    ["GET", "/health"],
+    ["GET", "/app"],
+    ["HEAD", "/health"],
+    ["OPTIONS", "/health"],
+    ["DELETE", "/health"],
+    // A static file is answered before any route runs.
+    ["GET", "/favicon.ico"],
+    ["HEAD", "/favicon.ico"],
   ]) {
     const held = heldConnection();
     held.socket.write(
-      requestHead(route, {
-        ...FORGED_DELIVERY,
-        "Transfer-Encoding": "chunked",
-      }) + tiny,
+      requestHead(
+        route,
+        { ...FORGED_DELIVERY, "Transfer-Encoding": "chunked" },
+        method,
+      ) + tiny,
     );
-    expect(await held.closedAfterMs).toBeLessThan(3_000);
+    expect(await held.closedAfterMs, `${method} ${route}`).toBeLessThan(3_000);
+  }
+});
+
+test("ordinary reads are unaffected by the chunk rule, on one kept-alive connection", async () => {
+  const answers = (received: string) =>
+    received.match(/^HTTP\/1\.1 \d{3}/gm)?.map((line) => line.slice(9)) ?? [];
+  const socket = connect(3210, "127.0.0.1");
+  let received = "";
+  socket.on("data", (data) => (received += data.toString("latin1")));
+  const send = async (head: string, expected: string[]) => {
+    socket.write(head);
+    await expect.poll(() => answers(received)).toEqual(expected);
+  };
+  try {
+    const plain = (method: string, path: string) =>
+      requestHead(path, {}, method);
+    await send(plain("GET", "/health"), ["200"]);
+    await send(plain("HEAD", "/health"), ["200", "200"]);
+    await send(plain("GET", "/favicon.ico"), ["200", "200", "200"]);
+    // A small declared body is read and discarded, and the connection goes on.
+    await send(
+      requestHead("/health", { "Transfer-Encoding": "chunked" }, "GET") +
+        "5\r\nhello\r\n0\r\n\r\n",
+      ["200", "200", "200", "200"],
+    );
+    await send(plain("GET", "/health"), ["200", "200", "200", "200", "200"]);
+    expect(socket.destroyed).toBe(false);
+  } finally {
+    socket.destroy();
   }
 });
 

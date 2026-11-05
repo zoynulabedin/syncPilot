@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import prisma from "../db.server";
+import { databaseNow } from "./database-clock.server";
 import {
   AlertTransportError,
   alertDestination,
@@ -11,8 +12,9 @@ import {
 export async function operationalCounts(
   workspaceId: string,
   lagMinutes: number,
-  now = new Date(),
+  at?: Date,
 ) {
+  const now = at ?? (await databaseNow());
   const [failed, held, lagging] = await Promise.all([
     prisma.syncJob.count({
       where: { workspaceId, status: { in: ["FAILED", "DEAD_LETTER"] } },
@@ -37,10 +39,11 @@ const payloadSchema = z.object({
 });
 
 /** Notify once when a threshold opens and once when it resolves. An unchanged condition stays quiet. */
-export async function evaluateAlerts(workspaceId: string, now = new Date()) {
+export async function evaluateAlerts(workspaceId: string, at?: Date) {
   if (!alertDestination()) return 0;
   return prisma.$transaction(async (tx) => {
     await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`alerts:${workspaceId}`}))::text`;
+    const now = at ?? (await databaseNow(tx));
     const setting = await tx.notificationSetting.findUnique({
       where: { workspaceId },
       include: { workspace: true },
@@ -109,8 +112,9 @@ export async function evaluateAlerts(workspaceId: string, now = new Date()) {
   });
 }
 
-export async function scheduleNotifications(now = new Date()) {
+export async function scheduleNotifications(at?: Date) {
   if (!alertDestination()) return 0;
+  const now = at ?? (await databaseNow());
   const settings = await prisma.notificationSetting.findMany({
     where: {
       enabled: true,
@@ -130,17 +134,15 @@ export async function scheduleNotifications(now = new Date()) {
   });
   let queued = 0;
   for (const setting of settings)
-    queued += await evaluateAlerts(setting.workspaceId, now);
+    queued += await evaluateAlerts(setting.workspaceId, at);
   return queued;
 }
 
 type Sender = (payload: unknown, id: string) => Promise<DeliveryResult>;
 /** A stable delivery ID is reused after a timeout; receivers should deduplicate Idempotency-Key. */
-export async function deliverNotification(
-  send: Sender = sendAlert,
-  now = new Date(),
-) {
+export async function deliverNotification(send: Sender = sendAlert, at?: Date) {
   const owner = randomUUID();
+  const now = at ?? (await databaseNow());
   const delivery = await prisma.$transaction(async (tx) => {
     await tx.notificationDelivery.updateMany({
       where: {

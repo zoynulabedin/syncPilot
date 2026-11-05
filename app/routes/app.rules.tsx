@@ -2,6 +2,7 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { Form, Link, useActionData, useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
 import { requireActor } from "../services/authorization.server";
+import { databaseNow } from "../services/database-clock.server";
 import {
   approvePreview,
   getPolicies,
@@ -52,7 +53,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   return {
     ...(await getPolicies(requireActor(await authenticate.admin(request)))),
     editingId: new URL(request.url).searchParams.get("edit"),
-    observedNow: Date.now(),
+    observedNow: (await databaseNow()).getTime(),
   };
 }
 

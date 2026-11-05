@@ -4,6 +4,7 @@ import type { Prisma, PrismaClient, SyncJob, SyncPolicy } from "@prisma/client";
 import { z } from "zod";
 import prisma from "../db.server";
 import { DomainError } from "../domain/guards";
+import { databaseNow } from "./database-clock.server";
 import {
   assertCurrentPlan,
   assertWriteGates,
@@ -46,6 +47,7 @@ import {
 type Database = PrismaClient | Prisma.TransactionClient;
 const toJson = (value: unknown) => value as Prisma.InputJsonValue;
 const LEASE_MS = 120_000;
+const leaseFrom = (now: Date) => new Date(now.getTime() + LEASE_MS);
 const workerIdentity = `${hostname()}:${process.pid}:${randomUUID()}`;
 const changeSchema = z.object({
   kind: z.enum(["PRODUCT", "PRICE", "VARIANT", "INVENTORY", "HOLD"]),
@@ -409,14 +411,15 @@ export async function buildLivePreview(
 }
 
 async function renew(job: SyncJob, workerId: string) {
+  const now = await databaseNow();
   const result = await prisma.syncJob.updateMany({
     where: {
       id: job.id,
       status: "RUNNING",
       leaseOwner: workerId,
-      leaseUntil: { gt: new Date() },
+      leaseUntil: { gt: now },
     },
-    data: { leaseUntil: new Date(Date.now() + LEASE_MS) },
+    data: { leaseUntil: leaseFrom(now) },
   });
   if (result.count !== 1)
     throw new SyncError(
@@ -425,7 +428,7 @@ async function renew(job: SyncJob, workerId: string) {
     );
   await prisma.workerHeartbeat.updateMany({
     where: { id: workerId },
-    data: { seenAt: new Date(), status: "RUNNING" },
+    data: { seenAt: now, status: "RUNNING" },
   });
 }
 function groups(changes: SyncChange[]) {
@@ -496,12 +499,13 @@ async function executeGroup(
           "Another worker is changing this resource.",
           true,
         );
+      const now = await databaseNow(tx);
       const current = await tx.syncJob.findFirst({
         where: {
           id: job.id,
           status: "RUNNING",
           leaseOwner: workerId,
-          leaseUntil: { gt: new Date() },
+          leaseUntil: { gt: now },
         },
       });
       if (!current)
@@ -517,7 +521,7 @@ async function executeGroup(
           policyId: policy.id,
           workspaceId: policy.workspaceId,
           status: "APPROVED",
-          expiresAt: { gt: new Date() },
+          expiresAt: { gt: now },
         },
       });
       if (!approval?.approvedBy)
@@ -583,12 +587,13 @@ async function executeGroup(
       // revocation or uninstall committed meanwhile refuses here, and none of
       // them waits for this transaction's Shopify calls.
       const verifyConsent = async () => {
+        const checkedAt = await databaseNow(tx);
         const active = await tx.syncJob.findFirst({
           where: {
             id: job.id,
             status: "RUNNING",
             leaseOwner: workerId,
-            leaseUntil: { gt: new Date() },
+            leaseUntil: { gt: checkedAt },
           },
         });
         if (!active)
@@ -604,7 +609,7 @@ async function executeGroup(
             policyId: policy.id,
             workspaceId: policy.workspaceId,
             status: "APPROVED",
-            expiresAt: { gt: new Date() },
+            expiresAt: { gt: checkedAt },
           },
         });
         if (!exactApproval?.approvedBy)
@@ -769,7 +774,7 @@ async function executeGroup(
               ...payload,
               completedGroups: [...new Set([...completed, key])],
             }),
-            leaseUntil: new Date(Date.now() + LEASE_MS),
+            leaseUntil: leaseFrom(await databaseNow(tx)),
           },
         });
         if (fenced.count !== 1)
@@ -829,7 +834,7 @@ async function applyPreview(job: SyncJob, workerId: string) {
     preview.status !== "APPROVED" ||
     !preview.approvedBy ||
     !preview.approvedAt ||
-    preview.expiresAt <= new Date()
+    preview.expiresAt <= (await databaseNow())
   )
     throw new SyncError(
       "APPROVAL_REQUIRED",
@@ -902,6 +907,7 @@ async function reconcile(job: SyncJob, workerId: string) {
   });
   const preview = await buildLivePreview(policy.id, () => renew(job, workerId));
   await prisma.$transaction(async (tx) => {
+    const now = await databaseNow(tx);
     await tx.reconciliationRun.update({
       where: { id: runId },
       data: {
@@ -909,7 +915,7 @@ async function reconcile(job: SyncJob, workerId: string) {
         findings: toJson(preview.changes),
         total: preview.changes.length,
         drifted: preview.changes.filter((c) => c.kind !== "HOLD").length,
-        completedAt: new Date(),
+        completedAt: now,
       },
     });
     const existing = await tx.syncPreview.findFirst({
@@ -919,7 +925,7 @@ async function reconcile(job: SyncJob, workerId: string) {
         status: "PENDING",
         sourceHash: preview.sourceHash,
         targetHash: preview.targetHash,
-        expiresAt: { gt: new Date() },
+        expiresAt: { gt: now },
       },
     });
     if (preview.changes.length && !existing)
@@ -931,7 +937,7 @@ async function reconcile(job: SyncJob, workerId: string) {
           sourceHash: preview.sourceHash,
           targetHash: preview.targetHash,
           changes: toJson(preview.changes),
-          expiresAt: new Date(Date.now() + 15 * 60_000),
+          expiresAt: new Date(now.getTime() + 15 * 60_000),
         },
       });
     for (const hold of preview.changes.filter((c) => c.kind === "HOLD")) {
@@ -1127,8 +1133,9 @@ async function refreshWebhook(job: SyncJob, workerId: string) {
 }
 
 async function recoverExpiredLeases() {
+  const now = await databaseNow();
   const expired = await prisma.syncJob.findMany({
-    where: { status: "RUNNING", leaseUntil: { lt: new Date() } },
+    where: { status: "RUNNING", leaseUntil: { lt: now } },
     take: 50,
   });
   for (const job of expired) {
@@ -1138,13 +1145,13 @@ async function recoverExpiredLeases() {
         where: {
           id: job.id,
           status: "RUNNING",
-          leaseUntil: { lt: new Date() },
+          leaseUntil: { lt: now },
         },
         data: {
           status: writes ? "HELD" : "RETRY",
           leaseUntil: null,
           leaseOwner: null,
-          availableAt: new Date(),
+          availableAt: now,
           lastError: writes
             ? "UNKNOWN_OUTCOME: Worker stopped during an approved write. Inspect current state and approve a fresh comparison."
             : "WORKER_RESTART: Resuming the last persisted checkpoint.",
@@ -1175,7 +1182,7 @@ async function recoverExpiredLeases() {
         data: {
           status: writes ? "HELD" : "INTERRUPTED",
           errorCode: "WORKER_RESTART",
-          completedAt: new Date(),
+          completedAt: now,
         },
       });
     });
@@ -1185,18 +1192,19 @@ async function claimJob(workerId: string) {
   return prisma.$transaction(async (tx) => {
     const rows = await tx.$queryRaw<
       { id: string; sourceShop: string }[]
-    >`SELECT j.id, j."sourceShop" FROM "SyncJob" j WHERE j.status IN ('PENDING','RETRY') AND j."availableAt" <= NOW() AND j.attempts < j."maxAttempts" AND NOT EXISTS (SELECT 1 FROM "SyncJob" running WHERE running.status = 'RUNNING' AND running."sourceShop" = j."sourceShop" AND running."leaseUntil" > NOW()) ORDER BY j."availableAt", j."createdAt" FOR UPDATE SKIP LOCKED LIMIT 1`;
+    >`SELECT j.id, j."sourceShop" FROM "SyncJob" j WHERE j.status IN ('PENDING','RETRY') AND j."availableAt" <= clock_timestamp()::timestamp(3) AND j.attempts < j."maxAttempts" AND NOT EXISTS (SELECT 1 FROM "SyncJob" running WHERE running.status = 'RUNNING' AND running."sourceShop" = j."sourceShop" AND running."leaseUntil" > NOW()) ORDER BY j."availableAt", j."createdAt" FOR UPDATE SKIP LOCKED LIMIT 1`;
     if (!rows[0]) return null;
     const locked = await tx.$queryRaw<
       { locked: boolean }[]
     >`SELECT pg_try_advisory_xact_lock(hashtext(${`claim:${rows[0].sourceShop}`})) AS locked`;
     if (!locked[0]?.locked) return null;
+    const now = await databaseNow(tx);
     if (
       await tx.syncJob.count({
         where: {
           sourceShop: rows[0].sourceShop,
           status: "RUNNING",
-          leaseUntil: { gt: new Date() },
+          leaseUntil: { gt: now },
         },
       })
     )
@@ -1207,8 +1215,8 @@ async function claimJob(workerId: string) {
         status: "RUNNING",
         attempts: { increment: 1 },
         leaseOwner: workerId,
-        leaseUntil: new Date(Date.now() + LEASE_MS),
-        startedAt: new Date(),
+        leaseUntil: leaseFrom(now),
+        startedAt: now,
         lastError: null,
       },
     });
@@ -1242,6 +1250,7 @@ async function failJob(job: SyncJob, workerId: string, error: unknown) {
   const status = retry ? "RETRY" : held ? "HELD" : "DEAD_LETTER";
   const message = `${failure.code}: ${failure.message}`;
   await prisma.$transaction(async (tx) => {
+    const now = await databaseNow(tx);
     const fenced = await tx.syncJob.updateMany({
       where: { id: job.id, status: "RUNNING", leaseOwner: workerId },
       data: {
@@ -1249,8 +1258,8 @@ async function failJob(job: SyncJob, workerId: string, error: unknown) {
         lastError: message,
         leaseOwner: null,
         leaseUntil: null,
-        availableAt: new Date(Date.now() + retryDelay(job.attempts)),
-        ...(retry ? {} : { completedAt: new Date() }),
+        availableAt: new Date(now.getTime() + retryDelay(job.attempts)),
+        ...(retry ? {} : { completedAt: now }),
       },
     });
     if (!fenced.count) return;
@@ -1260,7 +1269,7 @@ async function failJob(job: SyncJob, workerId: string, error: unknown) {
         status,
         errorCode: failure.code,
         details: { message: failure.message },
-        completedAt: new Date(),
+        completedAt: now,
       },
     });
     if (
@@ -1326,7 +1335,7 @@ export async function runWorkerOnce(workerId = workerIdentity) {
   await prisma.workerHeartbeat.upsert({
     where: { id: workerId },
     create: { id: workerId, status: "RUNNING" },
-    update: { seenAt: new Date(), status: "RUNNING" },
+    update: { seenAt: await databaseNow(), status: "RUNNING" },
   });
   await recoverExpiredLeases();
   await dispatchInbox();
@@ -1419,7 +1428,8 @@ export async function runWorkerOnce(workerId = workerIdentity) {
 }
 
 /** Schedule comparisons only. Repair always requires a separate, exact preview approval. */
-export async function scheduleReconciliations(now = new Date()) {
+export async function scheduleReconciliations(at?: Date) {
+  const now = at ?? (await databaseNow());
   const policies = await prisma.syncPolicy.findMany({
     where: { enabled: true, status: "ACTIVE" },
     take: 1000,

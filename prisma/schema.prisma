@@ -296,6 +296,7 @@ model CatalogSnapshot {
   lastError   String?
   startedAt   DateTime @default(now())
   completedAt DateTime?
+  generation  Int      @default(autoincrement())
 
   @@index([shopDomain, startedAt])
 }
@@ -316,6 +317,7 @@ model ProductSnapshot {
   hash             String
   shopifyUpdatedAt DateTime?
   observedAt       DateTime @default(now())
+  generation       Int      @default(0)
 
   @@unique([shopDomain, productGid])
   @@index([shopDomain, title])
@@ -336,6 +338,7 @@ model VariantSnapshot {
   data             Json
   hash             String
   observedAt       DateTime @default(now())
+  generation       Int      @default(0)
 
   @@unique([shopDomain, variantGid])
   @@index([shopDomain, productGid])
@@ -349,6 +352,7 @@ model LocationSnapshot {
   name        String
   isActive    Boolean  @default(true)
   observedAt  DateTime @default(now())
+  generation  Int      @default(0)
 
   @@unique([shopDomain, locationGid])
 }
@@ -360,6 +364,7 @@ model InventorySnapshot {
   locationGid      String
   quantity         Int
   observedAt       DateTime @default(now())
+  generation       Int      @default(0)
 
   @@unique([shopDomain, inventoryItemGid, locationGid])
   @@index([shopDomain, locationGid])

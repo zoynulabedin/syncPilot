@@ -39,7 +39,7 @@ export function validChallenge(value: string, expected: string | null) {
 }
 export function assertPairingUsable(
   request: { state: string; expiresAt: Date; attempts: number },
-  now = new Date(),
+  now: Date,
 ) {
   if (request.expiresAt <= now)
     throw new DomainError(

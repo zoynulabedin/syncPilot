@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import prisma from "../db.server";
 import { normalizeShop } from "../domain/guards";
+import { databaseNow } from "./database-clock.server";
 
 export const PRIVACY_TOPICS = [
   "SHOP_REDACT",
@@ -16,7 +17,7 @@ export const PRIVACY_TOPICS = [
  * and a reinstall in that time holds it for review.
  */
 const ERASURE_HOLD_MS = 48 * 3_600_000;
-const erasureCutoff = () => new Date(Date.now() - ERASURE_HOLD_MS);
+const erasureCutoff = (now: Date) => new Date(now.getTime() - ERASURE_HOLD_MS);
 
 /** Call only with the topic/shop returned by Shopify's webhook authenticator. Never persist its payload. */
 export async function receivePrivacyRequest(
@@ -82,7 +83,7 @@ export async function processPrivacyRequest(id: string) {
       }
       if (
         connection?.uninstalledAt &&
-        connection.uninstalledAt > erasureCutoff()
+        connection.uninstalledAt > erasureCutoff(await databaseNow(tx))
       )
         return false;
       // Uninstall detaches connections, so discover historical workspace references too.
@@ -216,11 +217,12 @@ export async function processPrivacyRequest(id: string) {
 export async function processPrivacyRequests() {
   // A request inside the hold stays PENDING. Left in the batch, ten of them would
   // keep any request that is due from ever being reached.
+  const cutoff = erasureCutoff(await databaseNow());
   const requests = await prisma.$queryRaw<{ id: string }[]>`
     SELECT r.id FROM "PrivacyRequest" r
     LEFT JOIN "ShopConnection" c ON c."shopDomain" = r."shopDomain"
     WHERE r.status = 'PENDING'
-      AND (c."uninstalledAt" IS NULL OR c."uninstalledAt" <= ${erasureCutoff()})
+      AND (c."uninstalledAt" IS NULL OR c."uninstalledAt" <= ${cutoff})
     ORDER BY r."receivedAt", r.id
     LIMIT 10`;
   let completed = 0;

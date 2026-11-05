@@ -1,12 +1,21 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { PrismaClient } from "@prisma/client";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 import prisma from "../../app/db.server";
 import {
   UTC_TIME_ZONE_NAMES,
+  databaseNow,
   readDatabaseClock,
 } from "../../app/services/database-clock.server";
+import {
+  HOUR,
+  SECOND,
+  SKEWS,
+  databaseTime,
+  restoreProcessClock,
+  skewProcessClock,
+} from "./clock-skew";
 
 async function freshClock() {
   // Database-level defaults apply only to sessions opened after they change.
@@ -27,6 +36,42 @@ function logEntries(output: string) {
     }
   });
 }
+
+describe.skipIf(!process.env.TEST_DATABASE_URL)(
+  "the clock every process shares",
+  () => {
+    afterEach(restoreProcessClock);
+    it.each(SKEWS)(
+      "is the database's, with this process's clock an hour %s it",
+      async (_, direction) => {
+        const before = await databaseTime();
+        skewProcessClock(direction * HOUR);
+        const now = await databaseNow();
+        expect(now.getTime()).toBeGreaterThanOrEqual(before.getTime());
+        expect(now.getTime() - before.getTime()).toBeLessThan(10 * SECOND);
+      },
+    );
+    it("never reads earlier than a default stamped before it, in or out of a transaction", async () => {
+      // A now() default rounds to the column's milliseconds, up as well as down.
+      for (let i = 0; i < 100; i++) {
+        const row = await prisma.workspace.create({
+          data: { name: "Synthetic clock workspace" },
+        });
+        expect((await databaseNow()).getTime()).toBeGreaterThanOrEqual(
+          row.createdAt.getTime(),
+        );
+        await prisma.$transaction(async (tx) => {
+          const inside = await tx.workspace.create({
+            data: { name: "Synthetic clock workspace" },
+          });
+          expect((await databaseNow(tx)).getTime()).toBeGreaterThanOrEqual(
+            inside.createdAt.getTime(),
+          );
+        });
+      }
+    });
+  },
+);
 
 describe.skipIf(!process.env.TEST_DATABASE_URL)(
   "PostgreSQL session time zone guard",

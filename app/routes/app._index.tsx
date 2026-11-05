@@ -2,6 +2,7 @@ import type { LoaderFunctionArgs } from "react-router";
 import { Link, useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
 import { requireActor } from "../services/authorization.server";
+import { databaseNow } from "../services/database-clock.server";
 import { getOverview } from "../services/control-plane.server";
 import {
   EmptyState,
@@ -17,12 +18,13 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const overview = await getOverview(
     requireActor(await authenticate.admin(request)),
   );
+  const now = (await databaseNow()).getTime();
   return {
     ...overview,
     workerHealthy: overview.heartbeats.some(
       (heartbeat) =>
         heartbeat.status === "RUNNING" &&
-        Date.now() - new Date(heartbeat.seenAt).getTime() < 120_000,
+        now - new Date(heartbeat.seenAt).getTime() < 120_000,
     ),
   };
 }

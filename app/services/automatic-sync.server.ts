@@ -27,6 +27,7 @@ import {
   type Actor,
 } from "./authorization.server";
 import { getWorkspace } from "./control-plane.server";
+import { databaseNow } from "./database-clock.server";
 
 type Tx = Prisma.TransactionClient;
 const actorKey = (actor: Actor) => `${actor.shop}:${actor.userId}`;
@@ -174,7 +175,7 @@ export async function getAutomaticConsents(actor: Actor): Promise<ConsentPage> {
       workspaceId,
       policyId: { in: eligible },
       status: { in: ["PENDING", "APPLIED"] },
-      expiresAt: { gt: new Date() },
+      expiresAt: { gt: await databaseNow() },
     },
     orderBy: { createdAt: "desc" },
     take: 100,
@@ -217,7 +218,7 @@ export async function grantAutomaticConsent(actor: Actor, input: unknown) {
       policyId: data.policyId,
       workspaceId: context.workspaceId,
       status: { in: ["PENDING", "APPLIED"] },
-      expiresAt: { gt: new Date() },
+      expiresAt: { gt: await databaseNow() },
     },
   });
   if (!reviewed)
@@ -249,11 +250,12 @@ export async function grantAutomaticConsent(actor: Actor, input: unknown) {
       );
     if (policy.workspaceId !== fresh.workspaceId)
       throw new DomainError("POLICY_NOT_FOUND", "Policy not found.", 404);
+    const now = await databaseNow(tx);
     const preview = await tx.syncPreview.findFirst({
       where: {
         id: reviewed.id,
         workspaceId: fresh.workspaceId,
-        expiresAt: { gt: new Date() },
+        expiresAt: { gt: now },
         status: { in: ["PENDING", "APPLIED"] },
       },
     });
@@ -290,7 +292,7 @@ export async function grantAutomaticConsent(actor: Actor, input: unknown) {
       where: {
         policyId: policy.id,
         status: "ACTIVE",
-        expiresAt: { lte: new Date() },
+        expiresAt: { lte: now },
       },
       data: { status: "EXPIRED" },
     });
@@ -311,7 +313,7 @@ export async function grantAutomaticConsent(actor: Actor, input: unknown) {
         fingerprint,
         approvedBy: actorKey(actor),
         fields: policy.fields,
-        expiresAt: new Date(Date.now() + data.durationMinutes * 60_000),
+        expiresAt: new Date(now.getTime() + data.durationMinutes * 60_000),
         intervalMinutes: data.intervalMinutes,
         maxJobs: data.maxJobs,
         maxChanges: data.maxChanges,
@@ -416,7 +418,7 @@ export async function assertJobConsent(
     consent.workspaceId !== job.workspaceId ||
     consent.policyId !== job.policyId ||
     consent.status !== "ACTIVE" ||
-    consent.expiresAt <= new Date()
+    consent.expiresAt <= (await databaseNow(db))
   )
     throw new SyncError(
       "CONSENT_REVOKED",
@@ -453,12 +455,13 @@ export async function assertJobConsent(
   return consent;
 }
 
-export async function scheduleAutomaticSync(now = new Date()) {
+export async function scheduleAutomaticSync(at?: Date) {
   if (
     process.env.AUTOMATIC_SYNC_ENABLED !== "true" ||
     process.env.SYNC_WRITE_ENABLED !== "true"
   )
     return 0;
+  const now = at ?? (await databaseNow());
   await prisma.automaticConsent.updateMany({
     where: { status: "ACTIVE", expiresAt: { lte: now } },
     data: { status: "EXPIRED" },
@@ -569,12 +572,13 @@ export async function processAutomaticPreview(
         "CONSENT_REQUIRED",
         "An automatic job requires bounded consent.",
       );
+    const now = await databaseNow(tx);
     const lease = await tx.syncJob.findFirst({
       where: {
         id: job.id,
         status: "RUNNING",
         leaseOwner: job.leaseOwner,
-        leaseUntil: { gt: new Date() },
+        leaseUntil: { gt: now },
       },
     });
     if (!lease)
@@ -619,13 +623,13 @@ export async function processAutomaticPreview(
         policyId: job.policyId,
         createdBy: "system:automatic-sync",
         approvedBy: consent.approvedBy,
-        approvedAt: new Date(),
+        approvedAt: now,
         status: "APPROVED",
         sourceHash: live.sourceHash,
         targetHash: live.targetHash,
         changes: live.changes as Prisma.InputJsonValue,
         expiresAt: new Date(
-          Math.min(consent.expiresAt.getTime(), Date.now() + 15 * 60_000),
+          Math.min(consent.expiresAt.getTime(), now.getTime() + 15 * 60_000),
         ),
       },
     });

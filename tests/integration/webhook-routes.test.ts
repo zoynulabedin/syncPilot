@@ -50,7 +50,16 @@ import {
   RATE_LIMITS,
   rateLimitKey,
 } from "../../app/services/rate-limit.server";
+import { logger } from "../../app/services/logger.server";
 import { anonymousBodies } from "../../app/services/request-body.server";
+import {
+  SKEWS,
+  databaseTime,
+  fromDatabase,
+  remaining,
+  restoreProcessClock,
+  skewProcessClock,
+} from "./clock-skew";
 
 const HOUR = 3_600_000;
 const MiB = 1024 * 1024;
@@ -910,6 +919,95 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
       });
     });
 
+    describe.each(SKEWS)(
+      "with this process's clock %s the database's",
+      (_, direction) => {
+        afterEach(restoreProcessClock);
+        const atDatabase = async (ms = 0) => at(await fromDatabase(ms));
+
+        it("takes a real uninstall stamped now, 49 hours of skew or not", async () => {
+          const f = await pairedStores();
+          await offlineSession(f.a.shop, HOUR);
+          skewProcessClock(direction * 49 * HOUR);
+          expect(
+            await status(uninstalled, uninstall(f.a.shop, await atDatabase())),
+          ).toBe(200);
+          expect(
+            await installation(f.a.shop, f.workspaceId, f.policyId),
+          ).toEqual(REVOKED);
+          const connection = await prisma.shopConnection.findUniqueOrThrow({
+            where: { shopDomain: f.a.shop },
+          });
+          expect(
+            Math.abs(await remaining(connection.uninstalledAt)),
+          ).toBeLessThan(10_000);
+        });
+        it("refuses a delivery stamped too far from the database's clock", async () => {
+          const f = await pairedStores();
+          await offlineSession(f.a.shop, HOUR);
+          skewProcessClock(direction * 3 * HOUR);
+          expect(
+            await status(
+              uninstalled,
+              uninstall(f.a.shop, await atDatabase(10 * 60_000)),
+            ),
+          ).toBe(400);
+          expect(
+            await installation(f.a.shop, f.workspaceId, f.policyId),
+          ).toEqual(LIVE);
+        });
+        it("takes an uninstall right after a signed-in page, and ignores a retry older than it", async () => {
+          const f = await pairedStores();
+          await offlineSession(f.a.shop, HOUR);
+          skewProcessClock(direction * 4 * HOUR);
+          await ensureInstallation(f.a);
+          expect(
+            await status(
+              uninstalled,
+              uninstall(f.a.shop, await atDatabase(-3 * HOUR)),
+            ),
+          ).toBe(200);
+          expect(await audits(f.a.shop, "APP_UNINSTALL_IGNORED")).toBe(1);
+          expect(
+            await prisma.shopConnection.findUniqueOrThrow({
+              where: { shopDomain: f.a.shop },
+            }),
+          ).toMatchObject({ status: "CONNECTED" });
+          expect(
+            await status(uninstalled, uninstall(f.a.shop, await atDatabase())),
+          ).toBe(200);
+          expect(
+            await prisma.shopConnection.findUniqueOrThrow({
+              where: { shopDomain: f.a.shop },
+            }),
+          ).toMatchObject({ status: "UNINSTALLED" });
+        });
+        it("dates a reinstall by the database's clock, so only older deliveries lose to it", async () => {
+          const f = await pairedStores();
+          await offlineSession(f.a.shop, HOUR);
+          expect(await status(uninstalled, uninstall(f.a.shop))).toBe(200);
+          await offlineSession(f.a.shop, HOUR);
+          skewProcessClock(direction * 4 * HOUR);
+          await ensureInstallation(f.a);
+          const reinstalled = await prisma.shopConnection.findUniqueOrThrow({
+            where: { shopDomain: f.a.shop },
+          });
+          expect(reinstalled.status).toBe("CONNECTED");
+          expect(
+            Math.abs(await remaining(reinstalled.installedAt)),
+          ).toBeLessThan(10_000);
+          expect(
+            await status(
+              uninstalled,
+              uninstall(f.a.shop, await atDatabase(-HOUR)),
+            ),
+          ).toBe(200);
+          expect(await audits(f.a.shop, "APP_UNINSTALL_IGNORED")).toBe(1);
+          expect(await databaseTime()).toBeInstanceOf(Date);
+        });
+      },
+    );
+
     describe("identity proven from the signed body", () => {
       it("refuses a store X uninstall body sent with store Y's header and changes nothing", async () => {
         const x = await pairedStores();
@@ -928,15 +1026,14 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         expect(await audits(y.a.shop, "APP_UNINSTALL_IGNORED")).toBe(0);
       });
 
-      it("refuses bodies that do not name the store at all", async () => {
+      it("refuses a body that names no valid store, or is no store's body, and changes nothing", async () => {
         const f = await pairedStores();
         await offlineSession(f.a.shop, HOUR);
+        const warn = vi.spyOn(logger, "warn");
         for (const body of [
-          { id: 1 },
-          { id: 1, myshopify_domain: null },
           { id: 1, myshopify_domain: "not a domain" },
-          // A product delivery re-posted as an uninstall.
-          { id: 100, title: "Signed product" },
+          { id: 1, myshopify_domain: "" },
+          { id: 1, myshopify_domain: 7 },
           [],
           7,
         ])
@@ -946,7 +1043,77 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         expect(await installation(f.a.shop, f.workspaceId, f.policyId)).toEqual(
           LIVE,
         );
+        expect(await audits(f.a.shop, "APP_UNINSTALLED")).toBe(0);
+        const codes = warn.mock.calls.map(
+          ([fields]) => (fields as unknown as { code: string }).code,
+        );
+        expect(codes).not.toContain("WEBHOOK_SHOP_NOT_IN_BODY");
+        expect(codes).toContain("WEBHOOK_SHOP_MISMATCH");
+        warn.mockRestore();
       });
+
+      it.each([
+        ["null", { id: 1, myshopify_domain: null }],
+        ["absent", { id: 1 }],
+      ])(
+        "revokes on an uninstall whose signed store field is %s, and warns that it did",
+        async (_, body) => {
+          const f = await pairedStores();
+          await offlineSession(f.a.shop, HOUR);
+          const warn = vi.spyOn(logger, "warn");
+          expect(await status(uninstalled, uninstall(f.a.shop, {}, body))).toBe(
+            200,
+          );
+          expect(warn).toHaveBeenCalledWith(
+            {
+              code: "WEBHOOK_SHOP_NOT_IN_BODY",
+              topic: "APP_UNINSTALLED",
+              shop: f.a.shop,
+            },
+            expect.any(String),
+          );
+          warn.mockRestore();
+          expect(
+            await installation(f.a.shop, f.workspaceId, f.policyId),
+          ).toEqual(REVOKED);
+          expect(await audits(f.a.shop, "APP_UNINSTALLED")).toBe(1);
+        },
+      );
+
+      it("does not warn about a body that names the store", async () => {
+        const f = await pairedStores();
+        const warn = vi.spyOn(logger, "warn");
+        expect(await status(uninstalled, uninstall(f.a.shop))).toBe(200);
+        expect(warn).not.toHaveBeenCalled();
+        warn.mockRestore();
+      });
+
+      it.each([
+        ["shop/redact", "null", { shop_id: 1, shop_domain: null }],
+        ["shop/redact", "absent", { shop_id: 1 }],
+        ["customers/redact", "null", { shop_id: 1, shop_domain: null }],
+        ["customers/data_request", "null", { shop_id: 1, shop_domain: null }],
+      ])(
+        "keeps the strict check for erasure: %s with a %s store field is refused",
+        async (topic, _, body) => {
+          const f = await pairedStores();
+          await offlineSession(f.a.shop, HOUR);
+          expect(
+            await status(
+              privacy,
+              delivery("/webhooks/privacy", topic, f.a.shop, body),
+            ),
+          ).toBe(400);
+          expect(
+            await prisma.privacyRequest.count({
+              where: { shopDomain: f.a.shop },
+            }),
+          ).toBe(0);
+          expect(
+            await installation(f.a.shop, f.workspaceId, f.policyId),
+          ).toEqual(LIVE);
+        },
+      );
 
       it("compares the domain case-insensitively, as Shopify's domains are", async () => {
         const f = await pairedStores();

@@ -4,6 +4,7 @@ import prisma from "../app/db.server";
 import { logger } from "../app/services/logger.server";
 import {
   databaseClockRemedy,
+  databaseNow,
   readDatabaseClock,
 } from "../app/services/database-clock.server";
 import { scheduleAutomaticSync } from "../app/services/automatic-sync.server";
@@ -97,11 +98,13 @@ try {
     }
   }
 } finally {
-  await prisma.workerHeartbeat
-    .updateMany({
-      where: { id: workerId },
-      data: { status: "STOPPED", seenAt: new Date() },
-    })
+  await databaseNow()
+    .then((seenAt) =>
+      prisma.workerHeartbeat.updateMany({
+        where: { id: workerId },
+        data: { status: "STOPPED", seenAt },
+      }),
+    )
     .catch(() => undefined);
   await prisma.$disconnect();
   logger.info({ workerId }, "SyncPilot worker stopped");

@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Prisma } from "@prisma/client";
 import prisma from "../db.server";
 import { normalizeShop } from "../domain/guards";
+import { databaseNow } from "./database-clock.server";
 import {
   stableHash,
   SyncError,
@@ -75,6 +76,18 @@ const checkpointSchema = z.object({
 });
 type Progress = () => Promise<void>;
 const json = (value: unknown) => value as Prisma.InputJsonValue;
+type Stamp = { generation: number; observedAt: Date };
+/**
+ * Taken before each page is saved. A row counts for an import when it was saved
+ * after that import was created, whichever import saved it. One sequence orders
+ * the two, so no clock decides which rows a finished import deletes.
+ */
+async function nextStamp() {
+  const [stamp] = await prisma.$queryRaw<Stamp[]>`
+    SELECT nextval('"CatalogSnapshot_generation_seq"')::int AS "generation",
+      clock_timestamp()::timestamp(3) AS "observedAt"`;
+  return stamp;
+}
 
 /** Enqueue durable discovery. Ownership/pairing is checked before any other shop can be read. */
 export async function importCatalog(actor: Actor, shopDomain = actor.shop) {
@@ -141,7 +154,7 @@ export async function saveProduct(
   shop: string,
   product: ProductRecord,
   currency: string,
-  observedAt = new Date(),
+  stamp: Stamp,
 ) {
   const data = {
     title: product.title,
@@ -155,7 +168,7 @@ export async function saveProduct(
     data: json(product),
     hash: stableHash(product),
     shopifyUpdatedAt: product.updatedAt ? new Date(product.updatedAt) : null,
-    observedAt,
+    ...stamp,
   };
   await prisma.productSnapshot.upsert({
     where: {
@@ -168,7 +181,7 @@ export async function saveProduct(
 export async function saveVariant(
   shop: string,
   variant: VariantRecord,
-  observedAt = new Date(),
+  stamp: Stamp,
 ) {
   const data = {
     productGid: variant.product.id,
@@ -181,7 +194,7 @@ export async function saveVariant(
     tracked: variant.inventoryItem?.tracked ?? false,
     data: json(variant),
     hash: stableHash(variant),
-    observedAt,
+    ...stamp,
   };
   await prisma.variantSnapshot.upsert({
     where: {
@@ -258,8 +271,9 @@ export async function executeCatalogImport(
       })
       .parse(body);
     ensureCursor(page.pageInfo, checkpoint.after);
+    const stamp = await nextStamp();
     for (const product of page.nodes)
-      await saveProduct(shop, product, currency);
+      await saveProduct(shop, product, currency, stamp);
     await advance(
       page.pageInfo.hasNextPage
         ? { phase: "products", after: page.pageInfo.endCursor }
@@ -269,7 +283,7 @@ export async function executeCatalogImport(
       where: { id: snapshot.id },
       data: {
         products: await prisma.productSnapshot.count({
-          where: { shopDomain: shop, observedAt: { gte: snapshot.startedAt } },
+          where: { shopDomain: shop, generation: { gte: snapshot.generation } },
         }),
       },
     });
@@ -288,7 +302,8 @@ export async function executeCatalogImport(
       })
       .parse(body);
     ensureCursor(page.pageInfo, checkpoint.after);
-    for (const variant of page.nodes) await saveVariant(shop, variant);
+    const stamp = await nextStamp();
+    for (const variant of page.nodes) await saveVariant(shop, variant, stamp);
     await advance(
       page.pageInfo.hasNextPage
         ? { phase: "variants", after: page.pageInfo.endCursor }
@@ -298,7 +313,7 @@ export async function executeCatalogImport(
       where: { id: snapshot.id },
       data: {
         variants: await prisma.variantSnapshot.count({
-          where: { shopDomain: shop, observedAt: { gte: snapshot.startedAt } },
+          where: { shopDomain: shop, generation: { gte: snapshot.generation } },
         }),
       },
     });
@@ -317,6 +332,7 @@ export async function executeCatalogImport(
       })
       .parse(body);
     ensureCursor(page.pageInfo, checkpoint.after);
+    const stamp = await nextStamp();
     for (const location of page.nodes) {
       await prisma.locationSnapshot.upsert({
         where: {
@@ -330,11 +346,12 @@ export async function executeCatalogImport(
           locationGid: location.id,
           name: location.name,
           isActive: location.isActive,
+          ...stamp,
         },
         update: {
           name: location.name,
           isActive: location.isActive,
-          observedAt: new Date(),
+          ...stamp,
         },
       });
     }
@@ -347,7 +364,7 @@ export async function executeCatalogImport(
       where: { id: snapshot.id },
       data: {
         locations: await prisma.locationSnapshot.count({
-          where: { shopDomain: shop, observedAt: { gte: snapshot.startedAt } },
+          where: { shopDomain: shop, generation: { gte: snapshot.generation } },
         }),
       },
     });
@@ -358,7 +375,7 @@ export async function executeCatalogImport(
         shopDomain: shop,
         tracked: true,
         inventoryItemGid: { not: null },
-        observedAt: { gte: snapshot.startedAt },
+        generation: { gte: snapshot.generation },
       },
       select: { inventoryItemGid: true },
       distinct: ["inventoryItemGid"],
@@ -400,6 +417,7 @@ export async function executeCatalogImport(
         if (!parsed.inventoryItem) break; // Removed during import: the next preview quarantines its mapping.
         const page = parsed.inventoryItem.inventoryLevels;
         ensureCursor(page.pageInfo, after);
+        const stamp = await nextStamp();
         for (const level of page.nodes) {
           const available = level.quantities.find(
             (quantity) => quantity.name === "available",
@@ -412,8 +430,8 @@ export async function executeCatalogImport(
           };
           await prisma.inventorySnapshot.upsert({
             where: { shopDomain_inventoryItemGid_locationGid: identity },
-            create: { ...identity, quantity: available.quantity },
-            update: { quantity: available.quantity, observedAt: new Date() },
+            create: { ...identity, quantity: available.quantity, ...stamp },
+            update: { quantity: available.quantity, ...stamp },
           });
         }
         if (!page.pageInfo.hasNextPage) break;
@@ -425,23 +443,24 @@ export async function executeCatalogImport(
   }
   await progress();
   await prisma.$transaction(async (tx) => {
-    const stale = { shopDomain: shop, observedAt: { lt: snapshot.startedAt } };
+    const stale = { shopDomain: shop, generation: { lt: snapshot.generation } };
     await tx.inventorySnapshot.deleteMany({ where: stale });
     await tx.variantSnapshot.deleteMany({ where: stale });
     await tx.productSnapshot.deleteMany({ where: stale });
     await tx.locationSnapshot.deleteMany({ where: stale });
+    const now = await databaseNow(tx);
     await tx.catalogSnapshot.update({
       where: { id: snapshot.id },
       data: {
         status: "COMPLETED",
-        completedAt: new Date(),
+        completedAt: now,
         cursor: null,
         lastError: null,
       },
     });
     await tx.shopConnection.update({
       where: { shopDomain: shop },
-      data: { lastImportAt: new Date(), lastError: null },
+      data: { lastImportAt: now, lastError: null },
     });
   });
   return prisma.catalogSnapshot.findUniqueOrThrow({

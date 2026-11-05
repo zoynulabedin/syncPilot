@@ -18,6 +18,9 @@ vi.mock("../app/shopify.server", () => ({
 vi.mock("../app/services/control-plane.server", () => ({
   getWorkspace: mocks.workspace,
 }));
+vi.mock("../app/services/database-clock.server", () => ({
+  databaseNow: async () => new Date(),
+}));
 vi.mock("../app/db.server", () => ({
   default: {
     productSnapshot: { findMany: mocks.products, count: mocks.productCount },

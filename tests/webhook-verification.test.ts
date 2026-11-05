@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   parseShopifyTime,
   requireSignedShop,
+  requireUninstallShop,
   verifyWebhook,
 } from "../app/services/webhook-verification.server";
 
@@ -216,6 +217,36 @@ describe("proving the store from the signed body", () => {
     let thrown: unknown;
     try {
       requireSignedShop(webhook(payload), "myshopify_domain");
+    } catch (error) {
+      thrown = error;
+    }
+    expect((thrown as Response).status).toBe(400);
+  });
+  it.each([[{ myshopify_domain: null }], [{}], [{ id: 1 }]])(
+    "takes an uninstall body of %j, which names no store",
+    (payload) => {
+      expect(() => requireUninstallShop(webhook(payload))).not.toThrow();
+    },
+  );
+  it("takes an uninstall body naming this store in any case", () => {
+    expect(() =>
+      requireUninstallShop(
+        webhook({ myshopify_domain: "Verified.MyShopify.com" }),
+      ),
+    ).not.toThrow();
+  });
+  it.each([
+    [{ myshopify_domain: "other.myshopify.com" }],
+    [{ myshopify_domain: "not a domain" }],
+    [{ myshopify_domain: "" }],
+    [{ myshopify_domain: 7 }],
+    [null],
+    [[]],
+    ["verified.myshopify.com"],
+  ])("still rejects an uninstall body of %j", (payload) => {
+    let thrown: unknown;
+    try {
+      requireUninstallShop(webhook(payload));
     } catch (error) {
       thrown = error;
     }
