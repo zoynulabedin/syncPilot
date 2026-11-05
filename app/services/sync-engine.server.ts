@@ -1192,7 +1192,7 @@ async function claimJob(workerId: string) {
   return prisma.$transaction(async (tx) => {
     const rows = await tx.$queryRaw<
       { id: string; sourceShop: string }[]
-    >`SELECT j.id, j."sourceShop" FROM "SyncJob" j WHERE j.status IN ('PENDING','RETRY') AND j."availableAt" <= clock_timestamp()::timestamp(3) AND j.attempts < j."maxAttempts" AND NOT EXISTS (SELECT 1 FROM "SyncJob" running WHERE running.status = 'RUNNING' AND running."sourceShop" = j."sourceShop" AND running."leaseUntil" > NOW()) ORDER BY j."availableAt", j."createdAt" FOR UPDATE SKIP LOCKED LIMIT 1`;
+    >`SELECT j.id, j."sourceShop" FROM "SyncJob" j WHERE j.status IN ('PENDING','RETRY') AND j."availableAt" <= (clock_timestamp() AT TIME ZONE 'UTC')::timestamp(3) AND j.attempts < j."maxAttempts" AND NOT EXISTS (SELECT 1 FROM "SyncJob" running WHERE running.status = 'RUNNING' AND running."sourceShop" = j."sourceShop" AND running."leaseUntil" > NOW()) ORDER BY j."availableAt", j."createdAt" FOR UPDATE SKIP LOCKED LIMIT 1`;
     if (!rows[0]) return null;
     const locked = await tx.$queryRaw<
       { locked: boolean }[]

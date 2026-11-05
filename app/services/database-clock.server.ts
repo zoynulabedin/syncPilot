@@ -48,13 +48,16 @@ export function isUtcTimeZone(name: string) {
  * The one clock every process shares. The web process, the workers and a hosted
  * database are different machines whose clocks can differ by any amount, either
  * way, so a time another process will compare, or one compared with a stored
- * time, comes from here. The cast gives what the columns store, rounded as they
- * round, so this never reads earlier than a now() default written before it.
+ * time, comes from here. Prisma's engine fills @default(now()) and @updatedAt on
+ * the calling machine, so a column compared with this has a database default
+ * instead. Reading UTC gives what those columns store whatever the session's zone,
+ * and the cast rounds as they round, so this never reads earlier than one of those
+ * defaults written before it.
  */
 export async function databaseNow(db: Database = prisma) {
   const [row] = await db.$queryRaw<
     { now: Date }[]
-  >`SELECT clock_timestamp()::timestamp(3) AS "now"`;
+  >`SELECT (clock_timestamp() AT TIME ZONE 'UTC')::timestamp(3) AS "now"`;
   if (!row) throw new Error("The database clock is unavailable");
   return row.now;
 }

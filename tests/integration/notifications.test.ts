@@ -25,6 +25,7 @@ import {
   remaining,
   restoreProcessClock,
   skewProcessClock,
+  withMachineClockSkewed,
 } from "./clock-skew";
 
 async function fixture(externalEnabled = true) {
@@ -142,31 +143,31 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("durable opt-in alerts", () => {
     expect(row.errorCode).toBe("NETWORK_FAILURE");
     expect(JSON.stringify(row)).not.toContain("secret");
   });
+  const queued = async (
+    data: Partial<Prisma.NotificationDeliveryUncheckedCreateInput> = {},
+  ) => {
+    const { workspace } = await fixture();
+    return prisma.notificationDelivery.create({
+      data: {
+        workspaceId: workspace.id,
+        dedupKey: randomUUID(),
+        payload: {
+          kind: "FAILED",
+          state: "OPEN",
+          value: 1,
+          text: "Synthetic alert",
+        },
+        ...data,
+      },
+    });
+  };
+  const reload = (id: string) =>
+    prisma.notificationDelivery.findUniqueOrThrow({ where: { id } });
+  // A default this machine's engine stamped would wait out the difference here.
   describe.each(SKEWS)(
-    "with this process's clock an hour %s the database's",
+    "with this machine really an hour %s the database",
     (_, direction) => {
-      beforeEach(() => skewProcessClock(direction * HOUR));
-      afterEach(restoreProcessClock);
-      const queued = async (
-        data: Partial<Prisma.NotificationDeliveryUncheckedCreateInput> = {},
-      ) => {
-        const { workspace } = await fixture();
-        return prisma.notificationDelivery.create({
-          data: {
-            workspaceId: workspace.id,
-            dedupKey: randomUUID(),
-            payload: {
-              kind: "FAILED",
-              state: "OPEN",
-              value: 1,
-              text: "Synthetic alert",
-            },
-            ...data,
-          },
-        });
-      };
-      const reload = (id: string) =>
-        prisma.notificationDelivery.findUniqueOrThrow({ where: { id } });
+      withMachineClockSkewed(direction * HOUR);
 
       it("sends a delivery as soon as the database has queued it", async () => {
         const delivery = await queued();
@@ -186,6 +187,13 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("durable opt-in alerts", () => {
         expect(send).not.toHaveBeenCalled();
         expect((await reload(delivery.id)).status).toBe("CANCELLED");
       });
+    },
+  );
+  describe.each(SKEWS)(
+    "with this process's clock an hour %s the database's",
+    (_, direction) => {
+      beforeEach(() => skewProcessClock(direction * HOUR));
+      afterEach(restoreProcessClock);
       it("does not send a retry before its delay has passed", async () => {
         const delivery = await queued({
           status: "RETRY",

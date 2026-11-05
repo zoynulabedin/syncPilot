@@ -1034,6 +1034,10 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
           { id: 1, myshopify_domain: "not a domain" },
           { id: 1, myshopify_domain: "" },
           { id: 1, myshopify_domain: 7 },
+          // Another topic's signed body, re-posted as an uninstall with forged headers.
+          { id: 1, title: "A product" },
+          { shop_id: 1, shop_domain: "somebody-else.myshopify.com" },
+          { current: ["read_products"], updated_at: "2026-11-05T00:00:00Z" },
           [],
           7,
         ])
@@ -1051,32 +1055,29 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         expect(codes).toContain("WEBHOOK_SHOP_MISMATCH");
       });
 
-      it.each([
-        ["null", { id: 1, myshopify_domain: null }],
-        ["absent", { id: 1 }],
-      ])(
-        "revokes on an uninstall whose signed store field is %s, and warns that it did",
-        async (_, body) => {
-          const f = await pairedStores();
-          await offlineSession(f.a.shop, HOUR);
-          const warn = vi.spyOn(logger, "warn");
-          expect(await status(uninstalled, uninstall(f.a.shop, {}, body))).toBe(
-            200,
-          );
-          expect(warn).toHaveBeenCalledWith(
-            {
-              code: "WEBHOOK_SHOP_NOT_IN_BODY",
-              topic: "APP_UNINSTALLED",
-              shop: f.a.shop,
-            },
-            expect.any(String),
-          );
-          expect(
-            await installation(f.a.shop, f.workspaceId, f.policyId),
-          ).toEqual(REVOKED);
-          expect(await audits(f.a.shop, "APP_UNINSTALLED")).toBe(1);
-        },
-      );
+      it("revokes on an uninstall whose signed store field is null, and warns that it did", async () => {
+        const f = await pairedStores();
+        await offlineSession(f.a.shop, HOUR);
+        const warn = vi.spyOn(logger, "warn");
+        expect(
+          await status(
+            uninstalled,
+            uninstall(f.a.shop, {}, { id: 1, myshopify_domain: null }),
+          ),
+        ).toBe(200);
+        expect(warn).toHaveBeenCalledWith(
+          {
+            code: "WEBHOOK_SHOP_NOT_IN_BODY",
+            topic: "APP_UNINSTALLED",
+            shop: f.a.shop,
+          },
+          expect.any(String),
+        );
+        expect(await installation(f.a.shop, f.workspaceId, f.policyId)).toEqual(
+          REVOKED,
+        );
+        expect(await audits(f.a.shop, "APP_UNINSTALLED")).toBe(1);
+      });
 
       it("does not warn about a body that names the store", async () => {
         const f = await pairedStores();

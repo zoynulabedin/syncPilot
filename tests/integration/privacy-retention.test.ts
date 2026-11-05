@@ -26,6 +26,7 @@ import {
   fromDatabase,
   restoreProcessClock,
   skewProcessClock,
+  withMachineClockSkewed,
 } from "./clock-skew";
 
 async function fixture() {
@@ -374,6 +375,41 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
           const again = await closed(8);
           await cleanHistory();
           expect(await exists(again.id)).toBe(true);
+        });
+      },
+    );
+    // The engine would stamp the receipt on this machine and the uninstall on the
+    // database. With this machine behind, a redaction looked older than the uninstall.
+    describe.each(SKEWS)(
+      "with this machine really an hour %s the database",
+      (_, direction) => {
+        withMachineClockSkewed(direction * HOUR);
+
+        it("waits out the 48 hours for a redaction received right after the uninstall", async () => {
+          const { a } = await fixture();
+          await snapshot(a.shop);
+          await revokeInstallation(a.shop);
+          const request = await receivePrivacyRequest(
+            a.shop,
+            "SHOP_REDACT",
+            randomUUID(),
+          );
+          expect(await processPrivacyRequest(request.id)).toBe(false);
+          expect(
+            await prisma.privacyRequest.findUniqueOrThrow({
+              where: { id: request.id },
+            }),
+          ).toMatchObject({ status: "PENDING", outcome: null });
+          await prisma.shopConnection.update({
+            where: { shopDomain: a.shop },
+            data: { uninstalledAt: await fromDatabase(-49 * HOUR) },
+          });
+          expect(await processPrivacyRequest(request.id)).toBe(true);
+          expect(
+            await prisma.productSnapshot.count({
+              where: { shopDomain: a.shop },
+            }),
+          ).toBe(0);
         });
       },
     );

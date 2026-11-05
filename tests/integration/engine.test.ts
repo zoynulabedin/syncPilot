@@ -25,6 +25,7 @@ import {
   runWorkerOnce,
   scheduleReconciliations,
 } from "../../app/services/sync-engine.server";
+import { readDatabaseClock } from "../../app/services/database-clock.server";
 import { recordVerifiedWebhook } from "../../app/services/webhook-inbox.server";
 import {
   HOUR,
@@ -35,6 +36,7 @@ import {
   remaining,
   restoreProcessClock,
   skewProcessClock,
+  withMachineClockSkewed,
 } from "./clock-skew";
 
 const api = vi.hoisted(() => ({ request: vi.fn() }));
@@ -324,7 +326,7 @@ async function pairFixture(inventory = false) {
       status: "APPROVED",
       approvedBy: `${sourceShop}:101`,
       approvedAt: new Date(),
-      expiresAt: new Date(Date.now() + 60_000),
+      expiresAt: await fromDatabase(MINUTE),
     },
   });
   const job = await prisma.syncJob.create({
@@ -1081,8 +1083,164 @@ integration("durable synchronization PostgreSQL worker", () => {
         expect(left).toBeGreaterThan(14 * MINUTE);
         expect(left).toBeLessThanOrEqual(15 * MINUTE);
       });
+      it("gives each group of a plan the lease it needs, so the next group can run", async () => {
+        const f = await pairFixture();
+        f.source.variants[0].sku = "MASTER-SKU";
+        f.target.variants[0].sku = "OLD-SKU";
+        const policy = await prisma.syncPolicy.update({
+          where: { id: f.policy.id },
+          data: { fields: ["title", "sku"], syncVariants: true },
+        });
+        for (const [shop, catalog] of [
+          [f.sourceShop, f.source],
+          [f.targetShop, f.target],
+        ] as const)
+          await prisma.variantSnapshot.update({
+            where: {
+              shopDomain_variantGid: {
+                shopDomain: shop,
+                variantGid: catalog.variants[0].id,
+              },
+            },
+            data: { sku: catalog.variants[0].sku },
+          });
+        const plan = await buildPreview(policy.id);
+        expect(plan.changes.map((change) => change.kind)).toEqual([
+          "PRODUCT",
+          "VARIANT",
+        ]);
+        await prisma.syncPreview.update({
+          where: { id: f.preview.id },
+          data: {
+            sourceHash: plan.sourceHash,
+            targetHash: plan.targetHash,
+            changes: plan.changes,
+            expiresAt: await fromDatabase(10 * MINUTE),
+          },
+        });
+        process.env.SYNC_WRITE_ENABLED = "true";
+        api.request.mockImplementation(liveApi(f));
+        // The next group renews straight away, so read what each commit left. The
+        // claim and both groups each leave a lease; the last commit clears it.
+        const commit = prisma.$transaction.bind(prisma) as (
+          ...args: unknown[]
+        ) => Promise<unknown>;
+        const left: number[] = [];
+        const spy = vi.spyOn(prisma, "$transaction").mockImplementation((async (
+          ...args: unknown[]
+        ) => {
+          const result = await commit(...args);
+          const { leaseUntil } = await job(f.job.id);
+          if (leaseUntil) left.push(await remaining(leaseUntil));
+          return result;
+        }) as never);
+        try {
+          await runWorkerOnce(`skew-groups-${sequence}-${direction}`);
+        } finally {
+          spy.mockRestore();
+        }
+        expect((await job(f.job.id)).status).toBe("SUCCEEDED");
+        expect(f.target.products[0].title).toBe("Master title");
+        expect(f.target.variants[0].sku).toBe("MASTER-SKU");
+        expect(left.length).toBeGreaterThanOrEqual(3);
+        for (const lease of left) {
+          expect(lease).toBeGreaterThan(MINUTE);
+          expect(lease).toBeLessThanOrEqual(2 * MINUTE);
+        }
+      });
+      it("reports a current heartbeat with no job to run", async () => {
+        const worker = `skew-idle-${sequence}-${direction}`;
+        // The first call inserts the row and the second is the update path.
+        await runWorkerOnce(worker);
+        expect(await runWorkerOnce(worker)).toEqual({ processed: false });
+        const heartbeat = await prisma.workerHeartbeat.findUniqueOrThrow({
+          where: { id: worker },
+        });
+        expect(Math.abs(await remaining(heartbeat.seenAt))).toBeLessThan(
+          10 * SECOND,
+        );
+      });
     },
   );
+  // Prisma's engine stamps on this machine, so only a clock that really differs
+  // shows whether a column it stamps meets one the database stamps.
+  describe.each(SKEWS)(
+    "with this machine really an hour %s the database",
+    (_, direction) => {
+      withMachineClockSkewed(direction * HOUR);
+      const job = (id: string) =>
+        prisma.syncJob.findUniqueOrThrow({ where: { id } });
+
+      it("claims a job as soon as it is queued and keeps every row it imports", async () => {
+        const shop = await ownShop();
+        api.request.mockImplementation(
+          catalogApi(
+            [product(1), product(2)],
+            [variant(11, 1, true), variant(12, 2, true)],
+          ),
+        );
+        const { job: queued } = await catalogJob(shop, {
+          availableAt: undefined,
+        });
+        await runWorkerOnce(`real-skew-import-${sequence}`);
+        expect((await job(queued.id)).status).toBe("SUCCEEDED");
+        expect(
+          await prisma.productSnapshot.count({ where: { shopDomain: shop } }),
+        ).toBe(2);
+      });
+      it("applies a plan that is still valid under a lease that holds", async () => {
+        const f = await pairFixture();
+        await prisma.syncPreview.update({
+          where: { id: f.preview.id },
+          data: { expiresAt: await fromDatabase(10 * MINUTE) },
+        });
+        process.env.SYNC_WRITE_ENABLED = "true";
+        const handler = liveApi(f);
+        const leases: number[] = [];
+        api.request.mockImplementation(
+          async (s: string, doc: string, vars: Record<string, unknown>) => {
+            leases.push(await remaining((await job(f.job.id)).leaseUntil));
+            return handler(s, doc, vars);
+          },
+        );
+        await runWorkerOnce(`real-skew-apply-${sequence}`);
+        expect((await job(f.job.id)).status).toBe("SUCCEEDED");
+        expect(f.target.products[0].title).toBe("Master title");
+        for (const left of leases) {
+          expect(left).toBeGreaterThan(MINUTE);
+          expect(left).toBeLessThanOrEqual(2 * MINUTE);
+        }
+      });
+    },
+  );
+  it("claims and stamps by UTC from a session in another zone", async () => {
+    const { database } = await readDatabaseClock();
+    expect(database).toMatch(/^syncpilot_test_[a-f0-9]+$/);
+    const reconnectWith = async (setting: string) => {
+      await prisma.$executeRawUnsafe(`ALTER DATABASE "${database}" ${setting}`);
+      await prisma.$disconnect();
+    };
+    const shop = await ownShop();
+    api.request.mockImplementation(catalogApi([product(1)]));
+    await reconnectWith("SET timezone TO 'America/New_York'");
+    try {
+      expect(await readDatabaseClock()).toMatchObject({ utc: false });
+      const { job } = await catalogJob(shop, { availableAt: undefined });
+      await runWorkerOnce(`zone-${sequence}`);
+      expect(
+        (await prisma.syncJob.findUniqueOrThrow({ where: { id: job.id } }))
+          .status,
+      ).toBe("SUCCEEDED");
+      const row = await prisma.productSnapshot.findFirstOrThrow({
+        where: { shopDomain: shop },
+      });
+      expect(Math.abs(await remaining(row.observedAt))).toBeLessThan(
+        10 * SECOND,
+      );
+    } finally {
+      await reconnectWith("RESET timezone");
+    }
+  });
   it("leases at most one active import per shop across concurrent workers", async () => {
     const shop = await ownShop();
     await catalogJob(shop);
@@ -1121,7 +1279,7 @@ integration("durable synchronization PostgreSQL worker", () => {
       status: "RUNNING",
       attempts: 1,
       leaseOwner: "dead-worker",
-      leaseUntil: new Date(Date.now() - 1000),
+      leaseUntil: await fromDatabase(-SECOND),
     });
     await prisma.catalogSnapshot.update({
       where: { id: snapshot.id },
@@ -1149,7 +1307,7 @@ integration("durable synchronization PostgreSQL worker", () => {
         status: "RUNNING",
         attempts: 1,
         leaseOwner: "dead-writer",
-        leaseUntil: new Date(Date.now() - 1000),
+        leaseUntil: await fromDatabase(-SECOND),
       },
     });
     await prisma.syncAttempt.create({
@@ -1575,13 +1733,13 @@ integration("durable synchronization PostgreSQL worker", () => {
       // Only the refresh jobs run; the comparison they queue stays waiting.
       await prisma.syncJob.updateMany({
         where: { operation: "RECONCILE" },
-        data: { availableAt: new Date(Date.now() + 60_000) },
+        data: { availableAt: await fromDatabase(MINUTE) },
       });
       for (let i = 0; i < 3; i++) {
         await runWorkerOnce("event-worker");
         await prisma.syncJob.updateMany({
           where: { operation: "RECONCILE", status: "PENDING" },
-          data: { availableAt: new Date(Date.now() + 60_000) },
+          data: { availableAt: await fromDatabase(MINUTE) },
         });
       }
       const waiting = await comparisons(f.policy.id);

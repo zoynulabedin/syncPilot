@@ -42,6 +42,7 @@ import {
   remaining,
   restoreProcessClock,
   skewProcessClock,
+  withMachineClockSkewed,
 } from "./clock-skew";
 
 const changes = [
@@ -210,7 +211,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
       const other = await fixture(false);
       await prisma.storePairingRequest.update({
         where: { id: other.pending.request.id },
-        data: { expiresAt: new Date(Date.now() - 1000) },
+        data: { expiresAt: await fromDatabase(-SECOND) },
       });
       await expect(
         acceptPairing(other.b, {
@@ -583,7 +584,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
           sourceHash: "source-hash",
           targetHash: "target-hash",
           changes,
-          expiresAt: new Date(Date.now() + 60_000),
+          expiresAt: await fromDatabase(MINUTE),
         },
       });
       await expect(approvePreview(a, preview.id)).rejects.toMatchObject({
@@ -609,6 +610,44 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         code: "JOB_NOT_RETRYABLE",
       });
     });
+    // The plan expires on the database's clock. A job the engine stamped on this
+    // machine, with this machine an hour ahead, would outlast the plan it applies.
+    describe.each(SKEWS)(
+      "with this machine really an hour %s the database",
+      (_, direction) => {
+        withMachineClockSkewed(direction * HOUR);
+
+        it("queues an approved plan's write to run at once", async () => {
+          const { a, b, workspaceId } = await fixture();
+          const policy = await savePolicy(a, policyData(a.shop, b.shop));
+          const preview = await prisma.syncPreview.create({
+            data: {
+              workspaceId,
+              policyId: policy.id,
+              createdBy: `${a.shop}:${a.userId}`,
+              sourceHash: "source-hash",
+              targetHash: "target-hash",
+              changes,
+              expiresAt: await fromDatabase(MINUTE),
+            },
+          });
+          process.env.SYNC_WRITE_ENABLED = "true";
+          await updatePolicy(a, policy.id, "ACTIVATE");
+          await approvePreview(a, preview.id);
+          const job = await prisma.syncJob.findFirstOrThrow({
+            where: { previewId: preview.id },
+          });
+          const wait = await remaining(job.availableAt);
+          expect(wait).toBeLessThanOrEqual(0);
+          expect(wait).toBeGreaterThan(-10 * SECOND);
+          // A later file's worker claims globally.
+          await prisma.syncJob.update({
+            where: { id: job.id },
+            data: { status: "CANCELLED" },
+          });
+        });
+      },
+    );
     it("serializes concurrent approvals into exactly one durable write job", async () => {
       const { a, b, workspaceId } = await fixture();
       const policy = await savePolicy(a, policyData(a.shop, b.shop));
@@ -620,7 +659,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
           sourceHash: "source-hash",
           targetHash: "target-hash",
           changes,
-          expiresAt: new Date(Date.now() + 60_000),
+          expiresAt: await fromDatabase(MINUTE),
         },
       });
       process.env.SYNC_WRITE_ENABLED = "true";
@@ -668,7 +707,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
           status: "APPROVED",
           approvedBy: `${a.shop}:${a.userId}`,
           approvedAt: new Date(),
-          expiresAt: new Date(Date.now() + 60_000),
+          expiresAt: await fromDatabase(MINUTE),
         },
       });
       const job = await prisma.syncJob.create({

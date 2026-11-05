@@ -60,8 +60,8 @@ model ShopConnection {
   workspaceId   String?
   workspace     Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
   status        String     @default("CONNECTED")
-  installedAt   DateTime   @default(now())
-  lastSeenAt    DateTime   @default(now())
+  installedAt   DateTime   @default(dbgenerated("timezone('UTC'::text, clock_timestamp())"))
+  lastSeenAt    DateTime   @default(dbgenerated("timezone('UTC'::text, clock_timestamp())"))
   uninstalledAt DateTime?
   shopGid       String?
   currency      String?
@@ -218,7 +218,7 @@ model SyncJob {
   previewId   String?
   payload     Json?
   idempotencyKey String? @unique
-  availableAt DateTime  @default(now())
+  availableAt DateTime  @default(dbgenerated("timezone('UTC'::text, clock_timestamp())"))
   leaseUntil  DateTime?
   leaseOwner  String?
   maxAttempts Int       @default(5)
@@ -423,7 +423,7 @@ model ReconciliationRun {
 
 model WorkerHeartbeat {
   id      String   @id
-  seenAt  DateTime @default(now())
+  seenAt  DateTime @default(dbgenerated("timezone('UTC'::text, clock_timestamp())"))
   status  String
   details Json?
 }
@@ -463,7 +463,7 @@ model PrivacyRequest {
   topic String
   status String @default("PENDING")
   outcome String?
-  receivedAt DateTime @default(now())
+  receivedAt DateTime @default(dbgenerated("timezone('UTC'::text, clock_timestamp())"))
   completedAt DateTime?
 
   @@index([status, receivedAt])
@@ -489,7 +489,7 @@ model NotificationDelivery {
   payload Json
   status String @default("PENDING")
   attempts Int @default(0)
-  availableAt DateTime @default(now())
+  availableAt DateTime @default(dbgenerated("timezone('UTC'::text, clock_timestamp())"))
   leaseUntil DateTime?
   leaseOwner String?
   errorCode String?
@@ -516,7 +516,7 @@ model AutomaticConsent {
   perRunChanges Int
   usedJobs Int @default(0)
   usedChanges Int @default(0)
-  nextRunAt DateTime @default(now())
+  nextRunAt DateTime @default(dbgenerated("timezone('UTC'::text, clock_timestamp())"))
   createdAt DateTime @default(now())
   revokedAt DateTime?
   @@index([status, nextRunAt])

@@ -85,7 +85,7 @@ type Stamp = { generation: number; observedAt: Date };
 async function nextStamp() {
   const [stamp] = await prisma.$queryRaw<Stamp[]>`
     SELECT nextval('"CatalogSnapshot_generation_seq"')::int AS "generation",
-      clock_timestamp()::timestamp(3) AS "observedAt"`;
+      (clock_timestamp() AT TIME ZONE 'UTC')::timestamp(3) AS "observedAt"`;
   return stamp;
 }
 

@@ -152,27 +152,31 @@ export function requireSignedShop(
 }
 
 /**
- * app/uninstalled only. Shopify's sample body has a null myshopify_domain, and
- * refusing a real delivery shaped that way would lose every uninstall to retries,
- * which is worse than the risk here: a revocation that pairing again undoes. A
- * body that names a store still has to name this one. Erasure cannot be undone,
- * so shop/redact and customers/* stay with requireSignedShop.
+ * app/uninstalled only. Shopify's sample body has myshopify_domain present and
+ * null, and refusing a real delivery shaped that way would lose every uninstall
+ * to retries. The worst result of accepting it is a revocation that pairing again
+ * undoes. The key must be there, though: no other subscribed topic's body has it,
+ * so accepting a body without it would let one captured delivery of any topic
+ * revoke any store by changing the headers. A body that names a store still has
+ * to name this one. Erasure cannot be undone, so shop/redact and customers/* stay
+ * with requireSignedShop.
  */
 export function requireUninstallShop(webhook: VerifiedWebhook) {
   const body = webhook.payload;
-  if (typeof body === "object" && body !== null && !Array.isArray(body)) {
-    const named = (body as Record<string, unknown>).myshopify_domain;
-    if (named === null || named === undefined) {
-      logger.warn(
-        {
-          code: "WEBHOOK_SHOP_NOT_IN_BODY",
-          topic: webhook.topic,
-          shop: webhook.shop,
-        },
-        "Signed uninstall names no store; acting on the unsigned shop header",
-      );
-      return;
-    }
+  if (
+    typeof body === "object" &&
+    body !== null &&
+    (body as Record<string, unknown>).myshopify_domain === null
+  ) {
+    logger.warn(
+      {
+        code: "WEBHOOK_SHOP_NOT_IN_BODY",
+        topic: webhook.topic,
+        shop: webhook.shop,
+      },
+      "Signed uninstall has a null store; acting on the unsigned shop header",
+    );
+    return;
   }
   requireSignedShop(webhook, "myshopify_domain");
 }

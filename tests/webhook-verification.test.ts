@@ -222,12 +222,11 @@ describe("proving the store from the signed body", () => {
     }
     expect((thrown as Response).status).toBe(400);
   });
-  it.each([[{ myshopify_domain: null }], [{}], [{ id: 1 }]])(
-    "takes an uninstall body of %j, which names no store",
-    (payload) => {
-      expect(() => requireUninstallShop(webhook(payload))).not.toThrow();
-    },
-  );
+  it("takes an uninstall body whose store field is present and null", () => {
+    expect(() =>
+      requireUninstallShop(webhook({ myshopify_domain: null })),
+    ).not.toThrow();
+  });
   it("takes an uninstall body naming this store in any case", () => {
     expect(() =>
       requireUninstallShop(
@@ -240,6 +239,9 @@ describe("proving the store from the signed body", () => {
     [{ myshopify_domain: "not a domain" }],
     [{ myshopify_domain: "" }],
     [{ myshopify_domain: 7 }],
+    [{}],
+    [{ id: 1 }],
+    [{ shop_id: 1, shop_domain: "verified.myshopify.com" }],
     [null],
     [[]],
     ["verified.myshopify.com"],

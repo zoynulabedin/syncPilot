@@ -16,12 +16,14 @@ import { updateInstallationScopes } from "../../app/services/installation.server
 import { action, loader } from "../../app/routes/app.stores";
 import {
   HOUR,
+  MINUTE,
   SECOND,
   SKEWS,
   fromDatabase,
   remaining,
   restoreProcessClock,
   skewProcessClock,
+  withMachineClockSkewed,
 } from "./clock-skew";
 
 const mocks = vi.hoisted(() => ({ request: vi.fn(), auth: vi.fn() }));
@@ -227,6 +229,44 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
       },
     );
 
+    // The engine would stamp a first install on this machine and a scope change on
+    // the database. With this machine ahead the change looked older than the store.
+    describe.each(SKEWS)(
+      "with this machine really an hour %s the database",
+      (_, direction) => {
+        withMachineClockSkewed(direction * HOUR);
+
+        it("acts on a scope change found right after the first install", async () => {
+          const { a, b, workspaceId } = await paired();
+          const policy = await prisma.syncPolicy.create({
+            data: {
+              workspaceId,
+              sourceShopDomain: a.shop,
+              targetShopDomain: b.shop,
+              fields: ["title"],
+              enabled: true,
+              status: "ACTIVE",
+            },
+          });
+          mocks.request.mockResolvedValueOnce(answerFor(a.shop));
+          await verifyStore(a, a.shop);
+          mocks.request.mockResolvedValueOnce(
+            answerFor(a.shop, ["read_products"]),
+          );
+          await verifyStore(a, a.shop);
+          expect(await audits(a.shop, "SCOPES_CHANGED")).toBe(1);
+          expect((await connection(a.shop)).scopes).toBe("read_products");
+          expect(
+            (
+              await prisma.syncPolicy.findUniqueOrThrow({
+                where: { id: policy.id },
+              })
+            ).status,
+          ).toBe("PAUSED");
+        });
+      },
+    );
+
     describe("scope changes still on their way", () => {
       const HOUR = 3_600_000;
       /** A paired store with live write authority, installed well before any change. */
@@ -389,7 +429,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         await f.reactivate();
         const delivered = await standing();
         await updateInstallationScopes(f.a.shop, SCOPES, {
-          updatedAt: new Date(Date.now() + 60_000),
+          updatedAt: await fromDatabase(MINUTE),
         });
         expect(await actors("SCOPES_CHANGED")).toEqual([
           byStaff,

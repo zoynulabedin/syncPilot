@@ -36,6 +36,7 @@ import {
   remaining,
   restoreProcessClock,
   skewProcessClock,
+  withMachineClockSkewed,
 } from "./clock-skew";
 
 const changes = [
@@ -994,7 +995,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
           });
           await prisma.automaticConsent.update({
             where: { id: granted.id },
-            data: { nextRunAt: new Date(Date.now() - MINUTE) },
+            data: { nextRunAt: await fromDatabase(-MINUTE) },
           });
           expect(await scheduleAutomaticSync()).toBe(1);
           const run = await prisma.syncJob.findFirstOrThrow({
@@ -1136,8 +1137,8 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
       const reviewed = await reviewedPlan(f, policyId);
       // The scheduler marks lapsed rows EXPIRED only while both switches are on.
       const lapsed = await consent(f, policyId, {
-        nextRunAt: new Date(Date.now() - 120 * MINUTE),
-        expiresAt: new Date(Date.now() - MINUTE),
+        nextRunAt: await fromDatabase(-120 * MINUTE),
+        expiresAt: await fromDatabase(-MINUTE),
       });
 
       await expect(
@@ -1152,6 +1153,34 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         grantAutomaticConsent(f.owner, grantInput(policyId, reviewed.id, 3)),
       ).rejects.toMatchObject({ code: "CONSENT_EXISTS" });
     });
+
+    // The engine would stamp nextRunAt on this machine and the scheduler reads the
+    // database's clock. With this machine ahead, a first run waited out the difference.
+    describe.each(SKEWS)(
+      "with this machine really an hour %s the database",
+      (_, direction) => {
+        withMachineClockSkewed(direction * HOUR);
+
+        it("starts a fresh consent's first run at once, then waits its interval", async () => {
+          const f = await pairFixture();
+          const { id: policyId } = await policy(f);
+          const reviewed = await reviewedPlan(f, policyId);
+          const granted = await grantAutomaticConsent(
+            f.owner,
+            grantInput(policyId, reviewed.id, 3),
+          );
+          expect(await scheduleAutomaticSync()).toBe(1);
+          expect(
+            await prisma.syncJob.count({
+              where: { policyId, operation: "AUTO_PREVIEW" },
+            }),
+          ).toBe(1);
+          const next = await remaining((await reload(granted.id)).nextRunAt);
+          expect(next).toBeGreaterThan(4 * MINUTE);
+          expect(next).toBeLessThanOrEqual(5 * MINUTE);
+        });
+      },
+    );
 
     describe.each(SKEWS)(
       "with this process's clock an hour %s the database's",
