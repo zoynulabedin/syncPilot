@@ -8,7 +8,10 @@ import {
   type Actor,
 } from "../../app/services/authorization.server";
 import {
+  RATE_LIMITS,
+  cleanExpiredRateLimits,
   consumeRateLimit,
+  enforceWebhookLimit,
   rateLimitKey,
 } from "../../app/services/rate-limit.server";
 import {
@@ -111,6 +114,66 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         Array<{ count: number }>
       >`SELECT "count" FROM "RequestRateLimit" WHERE "key" = ${key}`;
       expect(rows[0].count).toBe(1);
+    });
+
+    it("keeps an exhausted shop's catalog webhook budget from affecting other shops or lifecycle topics", async () => {
+      const id = randomUUID().replaceAll("-", "");
+      const busy = `webhook-a-${id}.myshopify.com`;
+      const quiet = `webhook-b-${id}.myshopify.com`;
+      const key = rateLimitKey("webhook:catalog", busy);
+      await prisma.$executeRaw`
+        INSERT INTO "RequestRateLimit" ("key", "count", "expiresAt")
+        VALUES (${key}, ${RATE_LIMITS.shopCatalogWebhook}, CURRENT_TIMESTAMP + INTERVAL '60 seconds')`;
+      const limited = await enforceWebhookLimit({
+        shop: busy,
+        topic: "PRODUCTS_UPDATE",
+      }).catch((error: unknown) => error);
+      expect((limited as Response).status).toBe(429);
+      // A case-varied shop header must not open a fresh bucket.
+      const varied = await enforceWebhookLimit({
+        shop: busy.toUpperCase(),
+        topic: "PRODUCTS_UPDATE",
+      }).catch((error: unknown) => error);
+      expect((varied as Response).status).toBe(429);
+      await expect(
+        enforceWebhookLimit({ shop: quiet, topic: "INVENTORY_LEVELS_UPDATE" }),
+      ).resolves.toBeUndefined();
+      for (const topic of [
+        "APP_UNINSTALLED",
+        "APP_SCOPES_UPDATE",
+        "CUSTOMERS_DATA_REQUEST",
+        "CUSTOMERS_REDACT",
+        "SHOP_REDACT",
+      ])
+        await expect(
+          enforceWebhookLimit({ shop: busy, topic }),
+        ).resolves.toBeUndefined();
+      const rows = await prisma.$queryRaw<
+        Array<{ key: string; count: number }>
+      >`SELECT "key", "count" FROM "RequestRateLimit" WHERE "key" IN (${key}, ${rateLimitKey("webhook:catalog", quiet)}) ORDER BY "count" DESC`;
+      expect(rows).toEqual([
+        { key, count: RATE_LIMITS.shopCatalogWebhook },
+        { key: rateLimitKey("webhook:catalog", quiet), count: 1 },
+      ]);
+    });
+
+    it("cleans only windows that expired more than a day ago", async () => {
+      const id = randomUUID();
+      const stale = rateLimitKey("cleanup", `${id}:stale`);
+      const recent = rateLimitKey("cleanup", `${id}:recent`);
+      const active = rateLimitKey("cleanup", `${id}:active`);
+      await prisma.$executeRaw`
+        INSERT INTO "RequestRateLimit" ("key", "count", "expiresAt") VALUES
+          (${stale}, 5, CURRENT_TIMESTAMP - INTERVAL '3650 days'),
+          (${recent}, 5, CURRENT_TIMESTAMP - INTERVAL '1 hour'),
+          (${active}, 5, CURRENT_TIMESTAMP + INTERVAL '60 seconds')`;
+      expect(await cleanExpiredRateLimits()).toBeGreaterThanOrEqual(1);
+      const rows = await prisma.$queryRaw<
+        Array<{ key: string }>
+      >`SELECT "key" FROM "RequestRateLimit" WHERE "key" IN (${stale}, ${recent}, ${active})`;
+      expect(rows.map((row) => row.key).sort()).toEqual(
+        [recent, active].sort(),
+      );
     });
 
     it("lets an operator prepare discovery and comparisons while owner actions stay protected", async () => {

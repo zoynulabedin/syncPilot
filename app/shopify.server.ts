@@ -10,7 +10,7 @@ import { resolveShopifyAppUrl } from "./services/environment.server";
 import { requireActor } from "./services/authorization.server";
 import {
   enforceActorLimit,
-  enforceIngressLimit,
+  enforceWebhookLimit,
 } from "./services/rate-limit.server";
 
 const shopify = shopifyApp({
@@ -34,23 +34,26 @@ const shopify = shopifyApp({
 export default shopify;
 export const apiVersion = ApiVersion.October26;
 export const addDocumentResponseHeaders = shopify.addDocumentResponseHeaders;
+// Budgets apply only after Shopify authentication succeeds (session token for
+// admin, body HMAC for webhooks), so rejected traffic never consumes a budget
+// or reaches the limiter's table. Webhook shop/topic come from unsigned headers
+// and are trusted as the library trusts them. Per-IP limits belong at the
+// reverse proxy; forwarding headers are not trusted.
 export const authenticate = {
   ...shopify.authenticate,
   admin: async (request: Request) => {
-    await enforceIngressLimit(request, "admin");
     const result = await shopify.authenticate.admin(request);
     await enforceActorLimit(request, requireActor(result));
     return result;
   },
   webhook: async (request: Request) => {
-    await enforceIngressLimit(request, "webhook");
-    return shopify.authenticate.webhook(request);
+    const result = await shopify.authenticate.webhook(request);
+    await enforceWebhookLimit(result);
+    return result;
   },
 };
 export const unauthenticated = shopify.unauthenticated;
-export const login: typeof shopify.login = async (request) => {
-  await enforceIngressLimit(request, "login");
-  return shopify.login(request);
-};
+// Login only validates the shop parameter and redirects; it does no database work.
+export const login = shopify.login;
 export const registerWebhooks = shopify.registerWebhooks;
 export const sessionStorage = shopify.sessionStorage;

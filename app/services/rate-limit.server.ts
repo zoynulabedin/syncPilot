@@ -5,18 +5,26 @@ import type { Actor } from "./authorization.server";
 
 type Database = Pick<PrismaClient | Prisma.TransactionClient, "$queryRaw">;
 export const RATE_LIMITS = {
-  adminIngress: 1200,
-  webhookIngress: 2400,
-  loginIngress: 120,
   shopRead: 600,
   shopWrite: 120,
   userRead: 180,
   userWrite: 30,
+  shopCatalogWebhook: 1200,
 } as const;
 const WINDOW_SECONDS = 60;
-const ingressRequests = new WeakMap<Request, Promise<void>>();
+const CLEANUP_BATCH = 1000;
+/**
+ * High-volume catalog topics, in the form @shopify/shopify-api returns after
+ * verification ("products/update" becomes "PRODUCTS_UPDATE"). Lifecycle and
+ * compliance topics are deliberately absent so they are never limited.
+ */
+export const LIMITED_WEBHOOK_TOPICS: ReadonlySet<string> = new Set([
+  "PRODUCTS_CREATE",
+  "PRODUCTS_UPDATE",
+  "PRODUCTS_DELETE",
+  "INVENTORY_LEVELS_UPDATE",
+]);
 const actorRequests = new WeakMap<Request, Promise<void>>();
-let cleanupAfter = 0;
 
 export function rateLimitKey(scope: string, identity: string) {
   return createHash("sha256")
@@ -72,36 +80,6 @@ export async function consumeRateLimit(
     });
 }
 
-export async function enforceIngressLimit(
-  request: Request,
-  kind: "admin" | "webhook" | "login",
-  db: Database = prisma,
-) {
-  const previous = ingressRequests.get(request);
-  if (previous) return previous;
-  const pending = (async () => {
-    // No unverified shop query, IP/forwarding header or token chooses this key.
-    const limit = RATE_LIMITS[`${kind}Ingress`];
-    await consumeRateLimit(`ingress:${kind}`, "application", limit, db);
-    if (Date.now() >= cleanupAfter) {
-      cleanupAfter = Date.now() + 60_000;
-      try {
-        await db.$queryRaw`
-          WITH expired AS (
-            SELECT "key" FROM "RequestRateLimit"
-            WHERE "expiresAt" < CURRENT_TIMESTAMP - INTERVAL '1 day'
-            ORDER BY "expiresAt" LIMIT 1000
-          ) DELETE FROM "RequestRateLimit" WHERE "key" IN (SELECT "key" FROM expired)
-        `;
-      } catch {
-        // Cleanup is bounded and best effort; enforcement above still succeeded.
-      }
-    }
-  })();
-  ingressRequests.set(request, pending);
-  return pending;
-}
-
 /** Call only after Shopify authenticate.admin verified this actor's identity. */
 export async function enforceActorLimit(
   request: Request,
@@ -128,4 +106,44 @@ export async function enforceActorLimit(
   })();
   actorRequests.set(request, pending);
   return pending;
+}
+
+/**
+ * Call only with the shop/topic returned by Shopify authenticate.webhook after
+ * HMAC verification. A limited delivery gets 429; Shopify retries it and
+ * scheduled reconciliation repairs any drift.
+ */
+export async function enforceWebhookLimit(
+  webhook: { shop: string; topic: string },
+  db: Database = prisma,
+) {
+  if (!LIMITED_WEBHOOK_TOPICS.has(webhook.topic)) return;
+  // The shop is the unsigned, unnormalized X-Shopify-Shop-Domain header, so
+  // key it as requireActor does; varying its case must not open a new bucket.
+  await consumeRateLimit(
+    "webhook:catalog",
+    webhook.shop.trim().toLowerCase(),
+    RATE_LIMITS.shopCatalogWebhook,
+    db,
+  );
+}
+
+/**
+ * Bounded worker housekeeping. Expired rows are reset in place on their next
+ * request, so only windows idle for a day are removed; the expiry is rechecked
+ * on delete so a window reset concurrently is kept.
+ */
+export async function cleanExpiredRateLimits(
+  db: Pick<PrismaClient, "$executeRaw"> = prisma,
+) {
+  return db.$executeRaw`
+    WITH expired AS (
+      SELECT "key" FROM "RequestRateLimit"
+      WHERE "expiresAt" < CURRENT_TIMESTAMP - INTERVAL '1 day'
+      ORDER BY "expiresAt" LIMIT ${CLEANUP_BATCH}
+    )
+    DELETE FROM "RequestRateLimit"
+    WHERE "key" IN (SELECT "key" FROM expired)
+      AND "expiresAt" < CURRENT_TIMESTAMP - INTERVAL '1 day'
+  `;
 }

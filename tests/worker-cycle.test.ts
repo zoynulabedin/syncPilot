@@ -1,5 +1,7 @@
+import type { PrismaClient } from "@prisma/client";
 import { describe, expect, it, vi } from "vitest";
 import { createWorkerCycle } from "../scripts/lib/worker-cycle";
+import { cleanExpiredRateLimits } from "../app/services/rate-limit.server";
 
 describe("worker maintenance isolation", () => {
   it("keeps processing jobs and other maintenance after a persistent housekeeping failure, with bounded retry cadence", async () => {
@@ -36,6 +38,36 @@ describe("worker maintenance isolation", () => {
     expect(broken).toHaveBeenCalledTimes(2);
     expect(healthy).toHaveBeenCalledTimes(2);
     expect(runJob).toHaveBeenCalledTimes(3);
+  });
+
+  it("runs request-limit cleanup on the maintenance cadence without blocking jobs", async () => {
+    let now = 0;
+    const execute = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("lock timeout"))
+      .mockResolvedValue(2);
+    const db = { $executeRaw: execute } as unknown as PrismaClient;
+    const runJob = vi.fn(async () => ({ processed: false }));
+    const onMaintenanceFailure = vi.fn();
+    const cycle = createWorkerCycle({
+      maintenance: [
+        { stage: "RATE_LIMIT_CLEANUP", run: () => cleanExpiredRateLimits(db) },
+      ],
+      runJob,
+      deliverAlert: async () => undefined,
+      onMaintenanceFailure,
+      now: () => now,
+    });
+    await cycle();
+    now = 30_000;
+    await cycle();
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(onMaintenanceFailure.mock.calls).toEqual([["RATE_LIMIT_CLEANUP"]]);
+    now = 60_000;
+    await cycle();
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(runJob).toHaveBeenCalledTimes(3);
+    expect(onMaintenanceFailure).toHaveBeenCalledTimes(1);
   });
 
   it("isolates alert outbox failures from successful queue work", async () => {

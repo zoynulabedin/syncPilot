@@ -1,5 +1,10 @@
 export type MaintenanceStage =
-  "RECONCILIATION" | "AUTOMATIC_SYNC" | "PRIVACY" | "RETENTION" | "ALERT_SCHEDULING";
+  | "RECONCILIATION"
+  | "AUTOMATIC_SYNC"
+  | "PRIVACY"
+  | "RETENTION"
+  | "RATE_LIMIT_CLEANUP"
+  | "ALERT_SCHEDULING";
 
 type MaintenanceTask = {
   stage: MaintenanceStage;
