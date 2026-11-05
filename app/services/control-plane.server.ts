@@ -27,6 +27,7 @@ import {
 import { stableHash } from "../domain/sync";
 import { listPage } from "./listing.server";
 import { alertDestination } from "./alert-transport.server";
+import { revokeStandingConsents } from "./installation.server";
 
 export { DomainError } from "../domain/guards";
 type Tx = Prisma.TransactionClient;
@@ -423,6 +424,15 @@ export async function disconnectStore(actor: Actor, shop: string) {
       where: { workspaceId: context.workspaceId },
       data: { enabled: false, status: "PAUSED" },
     });
+    await revokeStandingConsents(
+      tx,
+      { workspaceId: context.workspaceId },
+      {
+        actor: actorKey(actor),
+        shopDomain: actor.shop,
+        reason: "STORES_DISCONNECTED",
+      },
+    );
     await tx.syncJob.updateMany({
       where: {
         workspaceId: context.workspaceId,
@@ -430,8 +440,12 @@ export async function disconnectStore(actor: Actor, shop: string) {
       },
       data: { status: "CANCELLED", leaseUntil: null, leaseOwner: null },
     });
+    // Automatic plans are stored APPROVED; their writes were just cancelled.
     await tx.syncPreview.updateMany({
-      where: { workspaceId: context.workspaceId, status: "PENDING" },
+      where: {
+        workspaceId: context.workspaceId,
+        status: { in: ["PENDING", "APPROVED"] },
+      },
       data: { status: "REVOKED" },
     });
     await tx.storePair.updateMany({
@@ -640,11 +654,21 @@ async function requirePaused(tx: Tx, workspaceId: string) {
       409,
     );
 }
-async function invalidatePlans(tx: Tx, workspaceId: string, policyId?: string) {
-  await tx.automaticConsent.updateMany({
-    where: { workspaceId, ...(policyId ? { policyId } : {}), status: "ACTIVE" },
-    data: { status: "REVOKED", revokedAt: new Date() },
-  });
+async function invalidatePlans(
+  tx: Tx,
+  actor: Actor,
+  workspaceId: string,
+  policyId?: string,
+) {
+  await revokeStandingConsents(
+    tx,
+    { workspaceId, policyId },
+    {
+      actor: actorKey(actor),
+      shopDomain: actor.shop,
+      reason: "CONFIGURATION_CHANGED",
+    },
+  );
   await tx.syncPreview.updateMany({
     where: {
       workspaceId,
@@ -658,7 +682,7 @@ async function invalidatePlans(tx: Tx, workspaceId: string, policyId?: string) {
       workspaceId,
       ...(policyId ? { policyId } : {}),
       status: { in: ["PENDING", "RETRY"] },
-      operation: "APPLY_PREVIEW",
+      operation: { in: ["APPLY_PREVIEW", "AUTO_PREVIEW"] },
     },
     data: {
       status: "CANCELLED",
@@ -860,7 +884,7 @@ export async function saveMapping(actor: Actor, input: unknown) {
           },
         });
       }
-      await invalidatePlans(tx, context.workspaceId);
+      await invalidatePlans(tx, actor, context.workspaceId);
       await audit(
         tx,
         actor,
@@ -906,7 +930,7 @@ export async function deleteMapping(actor: Actor, input: unknown) {
           : await tx.locationMapping.deleteMany({ where });
     if (!removed.count)
       throw new DomainError("MAPPING_NOT_FOUND", "Mapping not found.", 404);
-    await invalidatePlans(tx, context.workspaceId);
+    await invalidatePlans(tx, actor, context.workspaceId);
     await audit(
       tx,
       actor,
@@ -1021,7 +1045,7 @@ export async function savePolicy(actor: Actor, input: unknown) {
     const policy = data.id
       ? await tx.syncPolicy.update({ where: { id: data.id }, data: record })
       : await tx.syncPolicy.create({ data: record });
-    await invalidatePlans(tx, context.workspaceId, policy.id);
+    await invalidatePlans(tx, actor, context.workspaceId, policy.id);
     await audit(
       tx,
       actor,
@@ -1172,6 +1196,34 @@ export async function updatePolicy(
           : {}),
       },
     });
+    // Activation moves updatedAt, which every consent fingerprint covers, so no
+    // earlier consent can pass again; revoke it rather than leave it ACTIVE.
+    const revoked = await revokeStandingConsents(
+      tx,
+      { workspaceId: context.workspaceId, policyId },
+      {
+        actor: actorKey(actor),
+        shopDomain: actor.shop,
+        reason: action === "ACTIVATE" ? "POLICY_ACTIVATED" : "POLICY_PAUSED",
+      },
+    );
+    if (action === "ACTIVATE" && revoked.length)
+      await tx.syncJob.updateMany({
+        where: {
+          workspaceId: context.workspaceId,
+          policyId,
+          status: { in: ["PENDING", "RETRY", "RUNNING"] },
+          OR: revoked.map((id) => ({
+            payload: { path: ["consentId"], equals: id },
+          })),
+        },
+        data: {
+          status: "CANCELLED",
+          leaseUntil: null,
+          leaseOwner: null,
+          lastError: "AUTOMATIC_CONSENT_REVOKED",
+        },
+      });
     if (action === "PAUSE") {
       await tx.syncJob.updateMany({
         where: {
@@ -1830,7 +1882,11 @@ export async function setMember(actor: Actor, input: unknown) {
         403,
       );
     if (shopDomain !== actor.shop)
-      throw new DomainError("STAFF_STORE_AUTHORITY", "Only the owner of this store can manage its staff access.", 403);
+      throw new DomainError(
+        "STAFF_STORE_AUTHORITY",
+        "Only the owner of this store can manage its staff access.",
+        403,
+      );
     const member = await tx.workspaceMember.upsert({
       where: {
         workspaceId_shopDomain_userId: {

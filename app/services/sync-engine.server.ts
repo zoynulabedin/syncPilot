@@ -38,7 +38,10 @@ import {
 } from "./catalog.server";
 import { shopifyRequest } from "./shopify-client.server";
 import { logger } from "./logger.server";
-import { assertJobConsent, processAutomaticPreview } from "./automatic-sync.server";
+import {
+  assertJobConsent,
+  processAutomaticPreview,
+} from "./automatic-sync.server";
 
 type Database = PrismaClient | Prisma.TransactionClient;
 const toJson = (value: unknown) => value as Prisma.InputJsonValue;
@@ -576,6 +579,9 @@ async function executeGroup(
           "MAPPING_MISSING",
           "Inventory or location mapping changed after preview.",
         );
+      // Plain reads right before each mutation, consent included: a pause,
+      // revocation or uninstall committed meanwhile refuses here, and none of
+      // them waits for this transaction's Shopify calls.
       const verifyConsent = async () => {
         const active = await tx.syncJob.findFirst({
           where: {
@@ -591,7 +597,7 @@ async function executeGroup(
             "The job was cancelled or its worker lease expired.",
           );
         await policyContext(policy.id, true, tx);
-      await assertJobConsent(job, tx);
+        await assertJobConsent(job, tx);
         const exactApproval = await tx.syncPreview.findFirst({
           where: {
             id: job.previewId ?? "",

@@ -1,5 +1,42 @@
+import type { Prisma } from "@prisma/client";
 import prisma from "../db.server";
 import { normalizeShop } from "../domain/guards";
+
+/**
+ * Standing automatic consent ends with the authority it was granted under.
+ * HELD rows are revoked too, so no leftover row looks reusable or blocks a
+ * fresh grant with CONSENT_EXISTS. Call it before cancelling queued jobs: the
+ * scheduler skips consent rows locked here, so it cannot queue a run between.
+ * Returns the revoked ids, for callers that cancel only the runs they carried.
+ */
+export async function revokeStandingConsents(
+  tx: Prisma.TransactionClient,
+  scope: { workspaceId: string; policyId?: string },
+  audit: { actor: string; shopDomain: string; reason: string },
+) {
+  const revoked = await tx.automaticConsent.updateManyAndReturn({
+    where: {
+      workspaceId: scope.workspaceId,
+      ...(scope.policyId ? { policyId: scope.policyId } : {}),
+      status: { in: ["ACTIVE", "HELD"] },
+    },
+    data: { status: "REVOKED", revokedAt: new Date() },
+    select: { id: true },
+  });
+  if (revoked.length)
+    await tx.auditEvent.createMany({
+      data: revoked.map(({ id }) => ({
+        workspaceId: scope.workspaceId,
+        shopDomain: audit.shopDomain,
+        actor: audit.actor,
+        action: "AUTOMATIC_CONSENT_REVOKED",
+        resourceType: "AutomaticConsent",
+        resourceId: id,
+        details: { reason: audit.reason },
+      })),
+    });
+  return revoked.map(({ id }) => id);
+}
 
 /** Called only after Shopify's webhook authenticator verifies the body. */
 export async function revokeInstallation(shopDomain: string) {
@@ -20,6 +57,16 @@ export async function revokeInstallation(shopDomain: string) {
         workspaceId: null,
       },
     });
+    if (workspaceId)
+      await revokeStandingConsents(
+        tx,
+        { workspaceId },
+        {
+          actor: "shopify:webhook",
+          shopDomain: shop,
+          reason: "APP_UNINSTALLED",
+        },
+      );
     await tx.syncJob.updateMany({
       where: {
         OR: [
@@ -99,6 +146,15 @@ export async function updateInstallationScopes(
       where: { shopDomain: shop },
     });
     if (connection?.workspaceId) {
+      await revokeStandingConsents(
+        tx,
+        { workspaceId: connection.workspaceId },
+        {
+          actor: "shopify:webhook",
+          shopDomain: shop,
+          reason: "SCOPES_CHANGED",
+        },
+      );
       await tx.syncPolicy.updateMany({
         where: { workspaceId: connection.workspaceId },
         data: { enabled: false, status: "PAUSED" },
@@ -113,7 +169,7 @@ export async function updateInstallationScopes(
       await tx.syncJob.updateMany({
         where: {
           workspaceId: connection.workspaceId,
-          operation: "APPLY_PREVIEW",
+          operation: { in: ["APPLY_PREVIEW", "AUTO_PREVIEW"] },
           status: { in: ["PENDING", "RETRY", "RUNNING"] },
         },
         data: {
