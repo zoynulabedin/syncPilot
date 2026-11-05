@@ -125,6 +125,7 @@ export default function Rules() {
     connections,
     previews,
     canManage,
+    canOperate,
     writesEnabled,
     inventoryWritesEnabled,
     editingId,
@@ -143,7 +144,14 @@ export default function Rules() {
       }
     >
       <Notice data={actionData} />
-      <ReadOnly canManage={canManage} />
+      {canOperate && !canManage ? (
+        <s-banner tone="info">
+          You have operator access. You can run dry-run previews; a store owner
+          must save, activate, pause or approve policies.
+        </s-banner>
+      ) : (
+        <ReadOnly canManage={canManage} />
+      )}
       {!writesEnabled && (
         <s-banner tone="info">
           The server write gate is closed. Drafts and dry runs work; approving
@@ -206,11 +214,12 @@ export default function Rules() {
                     >
                       Edit
                     </Link>
+                    {/* Operators may prepare plans; only owners change or approve them. */}
                     <InlineAction
                       intent="preview"
                       id={policy.id}
                       label="Dry run"
-                      disabled={!canManage}
+                      disabled={!canOperate}
                     />
                     {policy.enabled ? (
                       <InlineAction
@@ -335,7 +344,7 @@ export default function Rules() {
               <Field
                 name="inventoryMode"
                 label="Inventory policy"
-                hint="Shared stock pools and two-way inventory cannot be activated without an allocation ledger."
+                hint="Only one source store can own available stock. Two-way and shared-pool quantity sync are not available; stock pools are a manual planning ledger that never changes Shopify quantities."
               >
                 <select
                   id="inventoryMode"

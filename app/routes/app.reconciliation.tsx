@@ -8,7 +8,7 @@ import {
 } from "react-router";
 import { authenticate } from "../shopify.server";
 import { Pagination } from "../components/list-navigation";
-import { canOperate, requireActor } from "../services/authorization.server";
+import { requireActor } from "../services/authorization.server";
 import {
   getOperations,
   getPolicies,
@@ -38,7 +38,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
     getOperations(actor, new URL(request.url).searchParams),
     getPolicies(actor),
   ]);
-  return { ...operations, policies, canManage: await canOperate(actor) };
+  // getOperations already resolved the workspace role; reuse it instead of
+  // repeating the authorization lookups.
+  return { ...operations, policies, canManage: operations.canOperate };
 }
 export async function action({ request }: ActionFunctionArgs) {
   const actor = requireActor(await authenticate.admin(request));
@@ -201,8 +203,9 @@ export default function Reconciliation() {
             <div>
               <strong>Review drift and identity</strong>
               <p className="sp-muted">
-                Correct mapping issues and inspect stale quantities. Shared
-                stock pools need a separate allocation ledger.
+                Correct mapping issues and inspect stale quantities. Sync never
+                treats two stores as one shared stock pool; the Stock pools page
+                is only a manual planning ledger.
               </p>
             </div>
           </li>

@@ -148,8 +148,12 @@ export async function requireOperator(actor: Actor, db: Database = prisma) {
   return context;
 }
 
+/** UI capability check. Operator roles exist only inside a paired workspace, so
+ * staff on an unpaired store keep the read-only view instead of an error. */
 export async function canOperate(actor: Actor, db: Database = prisma) {
   if (actor.role === "OWNER") return true;
+  const connection = await currentConnection(actor, db);
+  if (!connection.workspaceId) return false;
   const context = await requireWorkspace(actor, db);
   return context.role === "OPERATOR";
 }
