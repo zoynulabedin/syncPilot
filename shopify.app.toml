@@ -3,7 +3,7 @@
 # Replace the example application URL and redirect URL before deployment.
 client_id = "9e4f72655806c046a597fbdd2e2de330"
 name = "SyncPilot"
-application_url = "https://example.com"
+application_url = "https://syncpilot.stockway.tech"
 embedded = true
 
 # Shopify CLI will map the temporary Cloudflare tunnel URL to the chosen dev store.
@@ -12,7 +12,7 @@ embedded = true
 automatically_update_urls_on_dev = true
 
 [auth]
-redirect_urls = ["https://example.com/auth/callback"]
+redirect_urls = ["https://syncpilot.stockway.tech/auth/callback"]
 
 [access_scopes]
 scopes = "read_products,write_products,read_inventory,write_inventory,read_locations"

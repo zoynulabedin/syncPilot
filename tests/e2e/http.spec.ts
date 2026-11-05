@@ -384,7 +384,7 @@ test("a body cut into tiny chunks ends the connection with any method on any rou
 
 test("ordinary reads are unaffected by the chunk rule, on one kept-alive connection", async () => {
   const answers = (received: string) =>
-    received.match(/^HTTP\/1\.1 \d{3}/gm)?.map((line) => line.slice(9)) ?? [];
+    received.match(/HTTP\/1\.1 \d{3}/g)?.map((line) => line.slice(9)) ?? [];
   const socket = connect(3210, "127.0.0.1");
   let received = "";
   socket.on("data", (data) => (received += data.toString("latin1")));

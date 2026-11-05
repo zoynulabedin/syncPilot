@@ -99,7 +99,7 @@ export async function ensureInstallation(actor: Actor) {
   const connection = await prisma.shopConnection.upsert({
     where: { shopDomain: actor.shop },
     create: { shopDomain: actor.shop },
-    // Later compared with Shopify's time for a delivery, so this one clock.
+    // A later delivery's time is compared with this, whichever process wrote it.
     update: { lastSeenAt: await databaseNow() },
   });
   if (connection.status === "CONNECTED" && !connection.uninstalledAt)

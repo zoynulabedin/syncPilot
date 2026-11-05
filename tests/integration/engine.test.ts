@@ -828,6 +828,32 @@ integration("durable synchronization PostgreSQL worker", () => {
         });
       },
     );
+    it("deletes nothing for an import that began before rows carried a generation, and the next import finishes the job", async () => {
+      const shop = await ownShop();
+      const { products, variants } = fixtureCatalog();
+      api.request.mockImplementation(catalogApi(products, variants));
+      await prisma.productSnapshot.create({
+        data: {
+          shopDomain: shop,
+          productGid: gid("Product", 999),
+          title: "Removed from the store",
+          status: "ACTIVE",
+          handle: "removed",
+          data: {},
+          hash: "synthetic",
+        },
+      });
+      const running = await prisma.catalogSnapshot.create({
+        data: { shopDomain: shop, status: "RUNNING", generation: 0 },
+      });
+      await executeCatalogImport(running.id, shop);
+      expect((await counts(shop)).products).toBe(3);
+      const next = await prisma.catalogSnapshot.create({
+        data: { shopDomain: shop, status: "QUEUED" },
+      });
+      await executeCatalogImport(next.id, shop);
+      expect((await counts(shop)).products).toBe(2);
+    });
     it("keeps what an older import wrote after a newer one began, when both resume", async () => {
       // A retry waits while a webhook's import runs for the same store, so two
       // imports can take turns. Neither may delete what the other just saw.

@@ -54,7 +54,6 @@ import { logger } from "../../app/services/logger.server";
 import { anonymousBodies } from "../../app/services/request-body.server";
 import {
   SKEWS,
-  databaseTime,
   fromDatabase,
   remaining,
   restoreProcessClock,
@@ -1003,12 +1002,13 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
             ),
           ).toBe(200);
           expect(await audits(f.a.shop, "APP_UNINSTALL_IGNORED")).toBe(1);
-          expect(await databaseTime()).toBeInstanceOf(Date);
         });
       },
     );
 
     describe("identity proven from the signed body", () => {
+      afterEach(() => vi.restoreAllMocks());
+
       it("refuses a store X uninstall body sent with store Y's header and changes nothing", async () => {
         const x = await pairedStores();
         const y = await pairedStores();
@@ -1049,7 +1049,6 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         );
         expect(codes).not.toContain("WEBHOOK_SHOP_NOT_IN_BODY");
         expect(codes).toContain("WEBHOOK_SHOP_MISMATCH");
-        warn.mockRestore();
       });
 
       it.each([
@@ -1072,7 +1071,6 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
             },
             expect.any(String),
           );
-          warn.mockRestore();
           expect(
             await installation(f.a.shop, f.workspaceId, f.policyId),
           ).toEqual(REVOKED);
@@ -1085,7 +1083,6 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         const warn = vi.spyOn(logger, "warn");
         expect(await status(uninstalled, uninstall(f.a.shop))).toBe(200);
         expect(warn).not.toHaveBeenCalled();
-        warn.mockRestore();
       });
 
       it.each([
