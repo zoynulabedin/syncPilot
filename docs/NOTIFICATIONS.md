@@ -12,4 +12,4 @@ PostgreSQL stores the outbox, transition deduplication and leased delivery attem
 
 Settings shows the last 10 attempts. Owner-opted retention removes eligible old delivered/cancelled records, preserving failures for review. Workspace erasure cascades outbox and alert-state records.
 
-A stopped worker cannot alert about its own absence. Configure independent Coolify/service monitoring for worker heartbeat, HTTPS availability, database health and backup age before production. Real receiver delivery and external monitoring acceptance remain deployment tasks.
+A stopped worker cannot alert about its own absence, including a worker that refused to start because the PostgreSQL session time zone is not UTC (`DATABASE_TIME_ZONE_NOT_UTC`). Delivery leases and retry timing depend on that zone; in a test run against a non-UTC database an alert was delivered twice. Configure independent Coolify/service monitoring for worker heartbeat, HTTPS availability, database health and backup age before production. Real receiver delivery and external monitoring acceptance remain deployment tasks.
