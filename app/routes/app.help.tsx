@@ -61,6 +61,34 @@ export default function Help() {
           </li>
         </ol>
       </Section>
+      <Section title="Bounded automatic sync">
+        <p>
+          After a policy is active and you have reviewed a fresh plan, a store
+          owner can grant standing consent for that policy. Consent covers only
+          one-way policies whose fields are all descriptive product fields:
+          title, description HTML, vendor, product type, tags, and SEO title and
+          description. Prices, handles, status, variants and inventory always
+          need an exact approval.
+        </p>
+        <p>
+          Each consent has an expiry, a minimum interval between runs, and run
+          and change budgets fixed when it is granted. A comparison that would
+          exceed them or touch another field holds the consent instead of
+          writing. Granting consent and every automatic run require both
+          deployment switches, AUTOMATIC_SYNC_ENABLED and SYNC_WRITE_ENABLED, to
+          be enabled by whoever runs the deployment; SyncPilot cannot change
+          them. Revoking consent never needs them.
+        </p>
+        <p>
+          Consent is revoked when the policy is paused or activated, the policy
+          or its mappings change, the stores are disconnected, the app is
+          uninstalled, or its access scopes change. The owner can also revoke it
+          at any time.
+        </p>
+        <div className="sp-actions">
+          <Link to="/app/automatic-sync">Open automatic sync →</Link>
+        </div>
+      </Section>
       <Section title="Inventory authority">
         <p>
           One source store owns available stock. Destination availability is
@@ -70,11 +98,20 @@ export default function Help() {
           shared-pool liability.
         </p>
         <p>
-          Independent physical pools should keep quantity sync disabled. Shared
-          physical pools require a separate reservation and allocation ledger,
-          which is not implemented in this release. Asynchronous copies do not
-          guarantee zero overselling at independent checkouts.
+          Independent physical pools should keep quantity sync disabled. Stock
+          pools are a manual planning ledger: an owner records a physical count,
+          per-store allowances and reservations. The ledger refuses allowances
+          beyond what remains of that count after active reservations and its
+          safety buffer, although a later count or buffer adjustment can leave
+          existing reservations inside the buffer. It never writes Shopify
+          quantities, never imports orders and does not prevent overselling, so
+          record every reservation, release and fulfillment there yourself.
+          Asynchronous copies do not guarantee zero overselling at independent
+          checkouts.
         </p>
+        <div className="sp-actions">
+          <Link to="/app/stock-pools">Open stock pools →</Link>
+        </div>
       </Section>
       <Section title="Recovery and conflicts">
         <p>
@@ -94,18 +131,36 @@ export default function Help() {
           <Link to="/app/reconciliation">Compare drift</Link>
         </div>
       </Section>
+      <Section title="Staff access">
+        <p>
+          After pairing, each store owner can grant their own store’s staff
+          access from Settings. Viewers can inspect workspace data. Operators
+          can also import catalogs, run dry-run previews and queue read-only
+          comparisons.
+        </p>
+        <p>
+          Only a verified Shopify store owner can approve writes, change
+          policies or mappings, grant or revoke automatic consent, or manage
+          staff. Owner authority comes from Shopify and cannot be delegated.
+        </p>
+        <div className="sp-actions">
+          <Link to="/app/settings">Open settings →</Link>
+        </div>
+      </Section>
       <Section title="Supported scope">
         <p>
-          This release updates selected fields on existing verified products:
-          title, description HTML, vendor, product type, handle, tags, status,
-          and variant price or compare-at price. It supports one authoritative
-          source for mapped location quantities.
+          This release updates selected fields on existing verified products and
+          variants: title, description HTML, vendor, product type, handle, tags,
+          status, SEO title and description, variant price, compare-at price,
+          SKU, tax status, and whether to keep selling when out of stock. It
+          supports one authoritative source for mapped location quantities.
         </p>
         <p>
           New product creation, variant structure changes, media, metafields,
-          collections, shared-pool allocation, deletion, and unattended write
-          consent are not available. Scheduled comparisons and webhook changes
-          create plans for owner review.
+          collections, shared-pool quantity sync and deletion are not available.
+          Scheduled comparisons and webhook changes create plans for owner
+          review; only an active automatic consent applies descriptive product
+          changes without a separate approval, within its limits.
         </p>
       </Section>
     </Page>

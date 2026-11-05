@@ -20,14 +20,12 @@ describe("Shopify client response semantics", () => {
     expect(execute).not.toHaveBeenCalled();
   });
   it("treats HTTP 200 GraphQL errors as failure and never returns partial data", async () => {
-    const execute = vi
-      .fn<GraphQLExecutor>()
-      .mockResolvedValue(
-        json({
-          data: { product: { id: "partial" } },
-          errors: [{ extensions: { code: "ACCESS_DENIED" } }],
-        }),
-      );
+    const execute = vi.fn<GraphQLExecutor>().mockResolvedValue(
+      json({
+        data: { product: { id: "partial" } },
+        errors: [{ extensions: { code: "ACCESS_DENIED" } }],
+      }),
+    );
     await expect(
       shopifyRequest(shop, "query {}", {}, { execute }),
     ).rejects.toMatchObject({ code: "PARTIAL_GRAPHQL_ERROR" });
