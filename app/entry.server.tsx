@@ -1,12 +1,32 @@
 import { PassThrough } from "stream";
 import { renderToPipeableStream } from "react-dom/server";
-import { ServerRouter } from "react-router";
+import { ServerRouter, isRouteErrorResponse } from "react-router";
 import { createReadableStreamFromReadable } from "@react-router/node";
-import { type EntryContext } from "react-router";
+import { type EntryContext, type HandleErrorFunction } from "react-router";
 import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
+import { logger, safeError } from "./services/logger.server";
 
 export const streamTimeout = 5000;
+
+// React Router's default prints errors with console.error, past the redaction
+// that logs get, and a request URL or token can be part of the message.
+export const handleError: HandleErrorFunction = (error, { request }) => {
+  if (request.signal.aborted) return;
+  logger.error(
+    {
+      err: safeError(
+        isRouteErrorResponse(error)
+          ? ((error as { error?: unknown }).error ??
+              `${error.status} ${error.statusText}`)
+          : error,
+      ),
+      method: request.method,
+      path: new URL(request.url).pathname,
+    },
+    "Request failed",
+  );
+};
 
 export default async function handleRequest(
   request: Request,
@@ -40,7 +60,7 @@ export default async function handleRequest(
         },
         onError(error) {
           responseStatusCode = 500;
-          console.error(error);
+          logger.error({ err: safeError(error) }, "Page failed to render");
         },
       },
     );

@@ -1148,7 +1148,16 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
     it("opening the page reactivates a reinstalled store instead of reporting it inactive", async () => {
       const f = await pairFixture();
       await revokeInstallation(f.sourceShop);
-      // Reinstalled through Shopify; no other page has loaded since.
+      // Reinstalled through Shopify, which issued new sessions; no other page has
+      // loaded since.
+      await prisma.session.create({
+        data: {
+          id: `offline_${f.sourceShop}`,
+          shop: f.sourceShop,
+          state: "synthetic",
+          accessToken: "synthetic-token",
+        },
+      });
       await expect(getAutomaticConsents(f.owner)).resolves.toMatchObject({
         paired: false,
         consents: [],

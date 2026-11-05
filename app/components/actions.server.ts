@@ -1,4 +1,8 @@
 import { data } from "react-router";
+import {
+  ACTION_FORM_LIMIT,
+  withBoundedBody,
+} from "../services/request-body.server";
 
 export async function readActionForm(request: Request): Promise<FormData> {
   const contentType = request.headers.get("Content-Type") || "";
@@ -12,23 +16,11 @@ export async function readActionForm(request: Request): Promise<FormData> {
     allowed.push(new URL(process.env.SHOPIFY_APP_URL).origin);
   if (origin && !allowed.includes(origin))
     throw new Response("Invalid request origin", { status: 403 });
-  const reader = request.body?.getReader();
-  const decoder = new TextDecoder();
-  let length = 0,
-    body = "";
-  if (reader) {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      length += value.byteLength;
-      if (length > 65_536) {
-        await reader.cancel();
-        throw new Response("Form is too large", { status: 413 });
-      }
-      body += decoder.decode(value, { stream: true });
-    }
-  }
-  body += decoder.decode();
+  const body = await withBoundedBody(
+    request,
+    ACTION_FORM_LIMIT,
+    (text) => text,
+  );
   return new Request(request.url, {
     method: "POST",
     headers: { "Content-Type": contentType },

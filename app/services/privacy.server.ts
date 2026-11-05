@@ -3,7 +3,20 @@ import { Prisma } from "@prisma/client";
 import prisma from "../db.server";
 import { normalizeShop } from "../domain/guards";
 
-const topics = ["SHOP_REDACT", "CUSTOMERS_REDACT", "CUSTOMERS_DATA_REQUEST"];
+export const PRIVACY_TOPICS = [
+  "SHOP_REDACT",
+  "CUSTOMERS_REDACT",
+  "CUSTOMERS_DATA_REQUEST",
+];
+/**
+ * Shopify sends shop/redact 48 hours after an uninstall and allows 30 days to act
+ * on it. Erasure cannot be undone, and neither delivery's headers are signed, so
+ * captured bodies replayed together must not erase a live store in one worker
+ * cycle. A request waits out the same 48 hours from the uninstall recorded here,
+ * and a reinstall in that time holds it for review.
+ */
+const ERASURE_HOLD_MS = 48 * 3_600_000;
+const erasureCutoff = () => new Date(Date.now() - ERASURE_HOLD_MS);
 
 /** Call only with the topic/shop returned by Shopify's webhook authenticator. Never persist its payload. */
 export async function receivePrivacyRequest(
@@ -12,7 +25,7 @@ export async function receivePrivacyRequest(
   deliveryId: string,
 ) {
   const shop = normalizeShop(shopDomain);
-  if (!topics.includes(topic) || !deliveryId || deliveryId.length > 200)
+  if (!PRIVACY_TOPICS.includes(topic) || !deliveryId || deliveryId.length > 200)
     throw new Response("Invalid privacy delivery", { status: 400 });
   const customerRequest = topic !== "SHOP_REDACT";
   const deliveryKey = createHash("sha256")
@@ -67,6 +80,11 @@ export async function processPrivacyRequest(id: string) {
         });
         return false;
       }
+      if (
+        connection?.uninstalledAt &&
+        connection.uninstalledAt > erasureCutoff()
+      )
+        return false;
       // Uninstall detaches connections, so discover historical workspace references too.
       const [
         members,
@@ -196,12 +214,15 @@ export async function processPrivacyRequest(id: string) {
 }
 
 export async function processPrivacyRequests() {
-  const requests = await prisma.privacyRequest.findMany({
-    where: { status: "PENDING" },
-    orderBy: [{ receivedAt: "asc" }, { id: "asc" }],
-    take: 10,
-    select: { id: true },
-  });
+  // A request inside the hold stays PENDING. Left in the batch, ten of them would
+  // keep any request that is due from ever being reached.
+  const requests = await prisma.$queryRaw<{ id: string }[]>`
+    SELECT r.id FROM "PrivacyRequest" r
+    LEFT JOIN "ShopConnection" c ON c."shopDomain" = r."shopDomain"
+    WHERE r.status = 'PENDING'
+      AND (c."uninstalledAt" IS NULL OR c."uninstalledAt" <= ${erasureCutoff()})
+    ORDER BY r."receivedAt", r.id
+    LIMIT 10`;
   let completed = 0;
   for (const request of requests)
     if (await processPrivacyRequest(request.id)) completed++;

@@ -1023,6 +1023,47 @@ export async function dispatchInbox(limit = 25) {
   return dispatched;
 }
 
+/**
+ * A source event can change what the destination should hold. A destination
+ * event matters only for a resource this policy maps: the comparison then checks
+ * the destination's live values against the fields the source owns, so a human
+ * edit shows as drift, and the app's own write compares clean. It never writes.
+ */
+async function eventCanDriftPolicy(
+  policy: SyncPolicy,
+  shop: string,
+  { topic, resourceId }: Prisma.JsonObject,
+) {
+  if (policy.sourceShopDomain === shop) return true;
+  const where = {
+    workspaceId: policy.workspaceId,
+    sourceShopDomain: policy.sourceShopDomain,
+    targetShopDomain: policy.targetShopDomain,
+  };
+  if (topic === "INVENTORY_LEVELS_UPDATE")
+    return (
+      policy.syncInventory &&
+      (typeof resourceId !== "string" ||
+        !!(await prisma.variantMapping.findFirst({
+          where: {
+            ...where,
+            targetInventoryGid: `gid://shopify/InventoryItem/${resourceId}`,
+          },
+          select: { id: true },
+        })))
+    );
+  return (
+    typeof resourceId !== "string" ||
+    !!(await prisma.productMapping.findFirst({
+      where: {
+        ...where,
+        targetProductGid: `gid://shopify/Product/${resourceId}`,
+      },
+      select: { id: true },
+    }))
+  );
+}
+
 async function refreshWebhook(job: SyncJob, workerId: string) {
   const payload = payloadObject(job.payload);
   let snapshotId =
@@ -1042,13 +1083,28 @@ async function refreshWebhook(job: SyncJob, workerId: string) {
   );
   const policies = await prisma.syncPolicy.findMany({
     where: {
-      sourceShopDomain: job.sourceShop,
+      OR: [
+        { sourceShopDomain: job.sourceShop },
+        { targetShopDomain: job.sourceShop },
+      ],
       workspaceId: job.workspaceId,
       enabled: true,
       status: "ACTIVE",
     },
   });
-  for (const policy of policies)
+  for (const policy of policies) {
+    if (!(await eventCanDriftPolicy(policy, job.sourceShop, payload))) continue;
+    // One that has not started reads live state when it runs, so it covers this.
+    const waiting = await prisma.syncJob.findFirst({
+      where: {
+        policyId: policy.id,
+        operation: "RECONCILE",
+        status: "PENDING",
+        attempts: 0,
+      },
+      select: { id: true },
+    });
+    if (waiting) continue;
     await prisma.syncJob.upsert({
       where: { idempotencyKey: `reconcile-event:${policy.id}:${job.eventId}` },
       create: {
@@ -1062,6 +1118,7 @@ async function refreshWebhook(job: SyncJob, workerId: string) {
       },
       update: {},
     });
+  }
   if (job.eventId)
     await prisma.webhookEvent.update({
       where: { id: job.eventId },
@@ -1250,7 +1307,9 @@ async function failJob(job: SyncJob, workerId: string, error: unknown) {
         },
       });
     }
-    if (job.eventId)
+    // A comparison queued from an event carries its eventId for correlation, but
+    // only the refresh decides the event: that import already finished.
+    if (job.eventId && job.operation === "WEBHOOK_REFRESH")
       await tx.webhookEvent.updateMany({
         where: { id: job.eventId },
         data: { status: retry ? "DISPATCHED" : "FAILED", lastError: message },

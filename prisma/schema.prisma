@@ -66,6 +66,7 @@ model ShopConnection {
   shopGid       String?
   currency      String?
   scopes        String?
+  scopesUpdatedAt DateTime?
   verifiedAt    DateTime?
   lastImportAt  DateTime?
   lastError     String?
@@ -190,9 +191,12 @@ model WebhookEvent {
   processedAt DateTime?
   attempts    Int       @default(0)
   lastError   String?
+  eventId     String?
+  triggeredAt DateTime?
 
   @@unique([shopDomain, deliveryId])
   @@index([shopDomain, receivedAt])
+  @@index([shopDomain, eventId])
   @@index([status, receivedAt])
 }
 

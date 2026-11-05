@@ -4,6 +4,7 @@ import prisma from "../../app/db.server";
 import { cleanWorkspaceHistory } from "../../app/services/retention.server";
 import {
   processPrivacyRequest,
+  processPrivacyRequests,
   receivePrivacyRequest,
 } from "../../app/services/privacy.server";
 import {
@@ -44,6 +45,12 @@ async function fixture() {
   });
   return { a, b, workspaceId: workspace.id };
 }
+/** Erasure waits on the uninstall's age, which these tests cannot wait out. */
+const uninstalledHoursAgo = (shopDomain: string, hours: number) =>
+  prisma.shopConnection.update({
+    where: { shopDomain },
+    data: { uninstalledAt: new Date(Date.now() - hours * 3_600_000) },
+  });
 async function snapshot(shopDomain: string) {
   return prisma.productSnapshot.create({
     data: {
@@ -208,6 +215,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         "SHOP_REDACT",
         "redaction-1",
       );
+      await uninstalledHoursAgo(a.shop, 49);
       expect(await processPrivacyRequest(request.id)).toBe(true);
       expect(
         await prisma.shopConnection.findUnique({
@@ -243,6 +251,15 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         "SHOP_REDACT",
         "redaction-reinstalled",
       );
+      // Reinstalling issues new sessions before any page runs.
+      await prisma.session.create({
+        data: {
+          id: `offline_${a.shop}`,
+          shop: a.shop,
+          state: "test",
+          accessToken: "synthetic-test-token",
+        },
+      });
       await ensureInstallation(a);
       expect(await processPrivacyRequest(request.id)).toBe(false);
       expect(
@@ -252,6 +269,111 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
           })
         ).status,
       ).toBe("HELD");
+      expect(
+        await prisma.productSnapshot.count({ where: { shopDomain: a.shop } }),
+      ).toBe(1);
+    });
+    it("waits out Shopify's 48 hours from the uninstall before erasing anything", async () => {
+      const { a, workspaceId } = await fixture();
+      await snapshot(a.shop);
+      await revokeInstallation(a.shop);
+      const request = await receivePrivacyRequest(
+        a.shop,
+        "SHOP_REDACT",
+        "redaction-early",
+      );
+      const untouched = async () => {
+        expect(await processPrivacyRequest(request.id)).toBe(false);
+        expect(
+          await prisma.privacyRequest.findUniqueOrThrow({
+            where: { id: request.id },
+          }),
+        ).toMatchObject({
+          status: "PENDING",
+          outcome: null,
+          shopDomain: a.shop,
+        });
+        expect(
+          await prisma.productSnapshot.count({ where: { shopDomain: a.shop } }),
+        ).toBe(1);
+        expect(
+          await prisma.workspace.findUnique({ where: { id: workspaceId } }),
+        ).not.toBeNull();
+      };
+      await untouched();
+      await uninstalledHoursAgo(a.shop, 47);
+      await untouched();
+      await uninstalledHoursAgo(a.shop, 49);
+      expect(await processPrivacyRequest(request.id)).toBe(true);
+      expect(
+        await prisma.productSnapshot.count({ where: { shopDomain: a.shop } }),
+      ).toBe(0);
+    });
+    it("does not let requests waiting out the 48 hours keep a due one from being reached", async () => {
+      const waiting = await fixture();
+      const due = await fixture();
+      await revokeInstallation(waiting.a.shop);
+      const waitingRows = [];
+      for (let i = 0; i < 12; i++)
+        waitingRows.push(
+          await receivePrivacyRequest(
+            waiting.a.shop,
+            "SHOP_REDACT",
+            `redaction-waiting-${i}`,
+          ),
+        );
+      await revokeInstallation(due.a.shop);
+      const dueRow = await receivePrivacyRequest(
+        due.a.shop,
+        "SHOP_REDACT",
+        "redaction-due",
+      );
+      await uninstalledHoursAgo(due.a.shop, 49);
+      // Rows other tests left behind are settled by the first passes.
+      for (let pass = 0; pass < 5; pass++) await processPrivacyRequests();
+      expect(
+        await prisma.privacyRequest.findUniqueOrThrow({
+          where: { id: dueRow.id },
+        }),
+      ).toMatchObject({ status: "COMPLETED", outcome: "SHOP_DATA_ERASED" });
+      expect(
+        await prisma.privacyRequest.count({
+          where: {
+            id: { in: waitingRows.map((row) => row.id) },
+            status: "PENDING",
+          },
+        }),
+      ).toBe(12);
+    });
+    it("holds for review when the store comes back during the 48 hours", async () => {
+      const { a } = await fixture();
+      await snapshot(a.shop);
+      await revokeInstallation(a.shop);
+      const request = await receivePrivacyRequest(
+        a.shop,
+        "SHOP_REDACT",
+        "redaction-came-back",
+      );
+      expect(await processPrivacyRequest(request.id)).toBe(false);
+      await prisma.session.create({
+        data: {
+          id: `offline_${a.shop}`,
+          shop: a.shop,
+          state: "test",
+          accessToken: "synthetic-test-token",
+        },
+      });
+      await ensureInstallation(a);
+      // Reached by the worker's own query, which does not skip a live store.
+      for (let pass = 0; pass < 5; pass++) await processPrivacyRequests();
+      expect(
+        await prisma.privacyRequest.findUniqueOrThrow({
+          where: { id: request.id },
+        }),
+      ).toMatchObject({
+        status: "HELD",
+        outcome: "INSTALLATION_CHANGED_REVIEW_REQUIRED",
+      });
       expect(
         await prisma.productSnapshot.count({ where: { shopDomain: a.shop } }),
       ).toBe(1);

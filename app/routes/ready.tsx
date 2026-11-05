@@ -30,22 +30,8 @@ export async function loader() {
       }
       return unavailable();
     }
-    if (process.env.REDIS_URL) {
-      const { default: Redis } = await import("ioredis");
-      const redis = new Redis(process.env.REDIS_URL, {
-        connectTimeout: 1500,
-        maxRetriesPerRequest: 0,
-        retryStrategy: () => null,
-        lazyConnect: true,
-      });
-      redis.on("error", () => undefined);
-      try {
-        await redis.connect();
-        await redis.ping();
-      } finally {
-        redis.disconnect();
-      }
-    }
+    // PostgreSQL is the queue. Nothing reads Redis, so its outage must not take
+    // the process that receives webhooks out of the proxy's rotation.
     return Response.json(
       { status: "ready" },
       { headers: { "Cache-Control": "no-store" } },

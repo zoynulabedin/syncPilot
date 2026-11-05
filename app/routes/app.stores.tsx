@@ -14,6 +14,7 @@ import {
   getStores,
   initiatePairing,
   rejectPairing,
+  verifyStore,
 } from "../services/control-plane.server";
 import {
   readActionForm,
@@ -72,6 +73,16 @@ export async function action({ request }: ActionFunctionArgs) {
       case "disconnect":
         await disconnectStore(actor, textField(form, "id"));
         break;
+      case "verify": {
+        const result = await verifyStore(actor, textField(form, "id"));
+        return result.verified
+          ? {
+              success: "Shopify confirmed this installation and its scopes.",
+              challenge: undefined,
+              requestId: undefined,
+            }
+          : { error: `Shopify check failed. ${result.message}` };
+      }
       default:
         return { error: "Choose a valid connection action." };
     }
@@ -86,7 +97,7 @@ export async function action({ request }: ActionFunctionArgs) {
 }
 
 export default function Stores() {
-  const { current, connections, pairings, workspace, canManage } =
+  const { current, connections, pairings, workspace, canManage, canVerify } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const revalidator = useRevalidator();
@@ -135,6 +146,7 @@ export default function Stores() {
             "Installation",
             "Pairing",
             "Last seen",
+            "Last verified",
             "Actions",
           ]}
         >
@@ -158,16 +170,30 @@ export default function Stores() {
                 <Time value={connection.lastSeenAt} />
               </td>
               <td>
-                {connection.workspaceId && (
-                  <InlineAction
-                    intent="disconnect"
-                    id={connection.shopDomain}
-                    label="Disconnect"
-                    danger
-                    disabled={!canManage}
-                    confirm="Disconnect this store? Policies will be paused and pending jobs cancelled. Reconnecting requires both owners to approve again."
-                  />
+                <Time value={connection.verifiedAt} />
+                {connection.lastError && (
+                  <div className="sp-risk">{connection.lastError}</div>
                 )}
+              </td>
+              <td>
+                <div className="sp-actions">
+                  <InlineAction
+                    intent="verify"
+                    id={connection.shopDomain}
+                    label="Verify"
+                    disabled={!canVerify}
+                  />
+                  {connection.workspaceId && (
+                    <InlineAction
+                      intent="disconnect"
+                      id={connection.shopDomain}
+                      label="Disconnect"
+                      danger
+                      disabled={!canManage}
+                      confirm="Disconnect this store? Policies will be paused and pending jobs cancelled. Reconnecting requires both owners to approve again."
+                    />
+                  )}
+                </div>
               </td>
             </tr>
           ))}

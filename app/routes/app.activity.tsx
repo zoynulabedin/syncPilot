@@ -264,6 +264,7 @@ export default function Activity() {
               "Topic / store",
               "Resource",
               "Processing state",
+              "Triggered",
               "Received",
               "Processed",
             ]}
@@ -273,6 +274,9 @@ export default function Activity() {
                 <td>
                   <strong>{event.topic.replaceAll("_", " ")}</strong>
                   <div className="sp-muted">{event.shopDomain}</div>
+                  {event.eventId && (
+                    <div className="sp-gid">Event {event.eventId}</div>
+                  )}
                 </td>
                 <td>
                   <Gid value={event.resourceId} />
@@ -282,6 +286,9 @@ export default function Activity() {
                   {event.lastError && (
                     <div className="sp-risk">{event.lastError}</div>
                   )}
+                </td>
+                <td>
+                  <Time value={event.triggeredAt} />
                 </td>
                 <td>
                   <Time value={event.receivedAt} />

@@ -8,6 +8,7 @@ import {
   requireOperator,
   requirePairAccess,
   requireWorkspace,
+  canOperate,
 } from "./authorization.server";
 import {
   DomainError,
@@ -24,10 +25,16 @@ import {
   validChallenge,
   validateGid,
 } from "../domain/guards";
-import { stableHash } from "../domain/sync";
+import { stableHash, SyncError } from "../domain/sync";
+import { INSTALLATION_CHECK_QUERY } from "../domain/sync-operations";
 import { listPage } from "./listing.server";
 import { alertDestination } from "./alert-transport.server";
-import { revokeStandingConsents } from "./installation.server";
+import {
+  reactivateInstallation,
+  revokeStandingConsents,
+  updateInstallationScopes,
+} from "./installation.server";
+import { shopifyRequest } from "./shopify-client.server";
 
 export { DomainError } from "../domain/guards";
 type Tx = Prisma.TransactionClient;
@@ -86,17 +93,16 @@ async function audit(
     },
   });
 }
+/** Records a signed-in page load. It proves nothing about the stored tokens. */
 export async function ensureInstallation(actor: Actor) {
-  return prisma.shopConnection.upsert({
+  const connection = await prisma.shopConnection.upsert({
     where: { shopDomain: actor.shop },
-    create: { shopDomain: actor.shop, verifiedAt: new Date() },
-    update: {
-      lastSeenAt: new Date(),
-      status: "CONNECTED",
-      uninstalledAt: null,
-      verifiedAt: new Date(),
-    },
+    create: { shopDomain: actor.shop },
+    update: { lastSeenAt: new Date() },
   });
+  if (connection.status === "CONNECTED" && !connection.uninstalledAt)
+    return connection;
+  return (await reactivateInstallation(actor.shop)) ?? connection;
 }
 export async function getWorkspace(actor: Actor) {
   const connection = await ensureInstallation(actor);
@@ -124,8 +130,105 @@ export async function getStores(actor: Actor) {
     connections: context.connections,
     workspace: context.workspace,
     canManage: actor.role === "OWNER",
+    canVerify: current.status === "CONNECTED" && (await canOperate(actor)),
     pairings: pairings.map(safePairing),
   };
+}
+/**
+ * The operator's check that a store's stored authorization still works: a live,
+ * read-only Shopify call, with the answer recorded either way. The owner of the
+ * store or an operator of its verified pair may run it. It writes nothing to
+ * Shopify, but scopes that changed end local write authority as a delivery would.
+ */
+export async function verifyStore(actor: Actor, shopDomain: string) {
+  const shop = normalizeShop(shopDomain);
+  if (actor.role === "OWNER") requireOwner(actor);
+  else await requireOperator(actor);
+  await currentConnection(actor);
+  if (shop !== actor.shop) await requirePairAccess(actor, shop);
+  const connection = await prisma.shopConnection.findUniqueOrThrow({
+    where: { shopDomain: shop },
+  });
+  const workspaceId = connection.workspaceId ?? undefined;
+  try {
+    const { shop: info, currentAppInstallation } = await shopifyRequest<{
+      shop: { id: string; myshopifyDomain: string; currencyCode: string };
+      currentAppInstallation: { accessScopes: { handle: string }[] };
+    }>(shop, INSTALLATION_CHECK_QUERY);
+    if (info.myshopifyDomain !== shop)
+      throw new SyncError(
+        "TENANT_DENIED",
+        "Shopify answered for a different store. Reinstall the app in this store.",
+      );
+    const granted = currentAppInstallation.accessScopes.map(
+      ({ handle }) => handle,
+    );
+    const scope = [...new Set(granted)].sort().join(",");
+    const verifiedAt = new Date();
+    // A recorded set that changed is a scope change, with what that revokes.
+    if (connection.scopes && connection.scopes !== scope)
+      await updateInstallationScopes(shop, granted, {
+        updatedAt: verifiedAt,
+        actor: actorKey(actor),
+      });
+    await prisma.$transaction(async (tx) => {
+      // A first reading only fills the blank. scopesUpdatedAt marks the last change
+      // applied, and moving it here would discard as older a real change whose
+      // delivery is still on its way, along with everything that change revokes.
+      await tx.shopConnection.updateMany({
+        where: { shopDomain: shop, scopes: null },
+        data: { scopes: scope },
+      });
+      await tx.shopConnection.update({
+        where: { shopDomain: shop },
+        data: {
+          shopGid: info.id,
+          currency: info.currencyCode,
+          verifiedAt,
+          lastError: null,
+        },
+      });
+      await audit(
+        tx,
+        actor,
+        "STORE_VERIFIED",
+        "ShopConnection",
+        connection.id,
+        workspaceId,
+        { shop, scopes: granted },
+      );
+    });
+    return { verified: true as const, scopes: granted };
+  } catch (error) {
+    const failure =
+      error instanceof SyncError
+        ? error
+        : new SyncError(
+            "UNKNOWN",
+            "The check could not be completed. Try again shortly.",
+          );
+    const lastError = `${failure.code}: ${failure.message}`;
+    await prisma.$transaction(async (tx) => {
+      await tx.shopConnection.update({
+        where: { shopDomain: shop },
+        data: { lastError },
+      });
+      await audit(
+        tx,
+        actor,
+        "STORE_VERIFICATION_FAILED",
+        "ShopConnection",
+        connection.id,
+        workspaceId,
+        { shop, code: failure.code },
+      );
+    });
+    return {
+      verified: false as const,
+      code: failure.code,
+      message: failure.message,
+    };
+  }
 }
 const pairingInput = z
   .object({

@@ -20,11 +20,23 @@ const installation = (row: Record<string, unknown>) => {
       Object.assign(row, update),
     ),
     findUnique: vi.fn(async () => ({ ...row })),
+    update: vi.fn(async ({ data }: { data: Record<string, unknown> }) =>
+      Object.assign(row, data),
+    ),
     findMany: vi
       .fn()
       .mockResolvedValue([{ shopDomain: shop }, { shopDomain: partner }]),
   };
-  Object.assign(mocks.prisma, { shopConnection });
+  // Reinstalling stored new sessions before this page's loader ran.
+  Object.assign(mocks.prisma, {
+    shopConnection,
+    session: { count: vi.fn().mockResolvedValue(1) },
+    auditEvent: { create: vi.fn() },
+    $queryRaw: vi.fn().mockResolvedValue([]),
+    $transaction: vi.fn(async (work: (tx: unknown) => unknown) =>
+      work(mocks.prisma),
+    ),
+  });
   return shopConnection;
 };
 
@@ -52,10 +64,10 @@ describe("stock pools loader", () => {
         connections: [],
         canManage: actor.role === "OWNER",
       });
-      expect(shopConnection.upsert).toHaveBeenCalledWith(
+      expect(shopConnection.update).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { shopDomain: shop },
-          update: expect.objectContaining({
+          data: expect.objectContaining({
             status: "CONNECTED",
             uninstalledAt: null,
           }),

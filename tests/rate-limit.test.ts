@@ -4,13 +4,18 @@ import { ApiVersion, shopifyApi } from "@shopify/shopify-api";
 import { createHmac } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const mocks = vi.hoisted(() => ({
-  query: vi.fn(),
-  execute: vi.fn(),
-  admin: vi.fn(),
-  webhook: vi.fn(),
-  login: vi.fn(),
-}));
+// Webhook verification stays real: only Shopify's admin session strategy and the
+// database are replaced, so these wrappers run the library's actual HMAC check.
+const mocks = vi.hoisted(() => {
+  process.env.SHOPIFY_API_KEY = "test-key";
+  process.env.SHOPIFY_API_SECRET = "test-secret";
+  return {
+    query: vi.fn(),
+    execute: vi.fn(),
+    admin: vi.fn(),
+    login: vi.fn(),
+  };
+});
 vi.mock("../app/db.server", () => ({
   default: { $queryRaw: mocks.query, $executeRaw: mocks.execute },
 }));
@@ -19,7 +24,7 @@ vi.mock("@shopify/shopify-app-react-router/server", () => ({
   ApiVersion: { October26: "2026-10" },
   AppDistribution: { SingleMerchant: "single_merchant" },
   shopifyApp: () => ({
-    authenticate: { admin: mocks.admin, webhook: mocks.webhook },
+    authenticate: { admin: mocks.admin },
     login: mocks.login,
   }),
 }));
@@ -252,9 +257,26 @@ describe("Shopify request wrappers", () => {
       },
     });
 
+  /** Correctly signed over its body; every header is what Shopify documents. */
+  const signed = (topic: string) => {
+    const body = JSON.stringify({ id: 1 });
+    return new Request("https://app.test/webhooks", {
+      method: "POST",
+      body,
+      headers: {
+        "X-Shopify-Hmac-Sha256": createHmac("sha256", "test-secret")
+          .update(body)
+          .digest("base64"),
+        "X-Shopify-Topic": topic,
+        "X-Shopify-Shop-Domain": shop,
+        "X-Shopify-API-Version": "2026-10",
+        "X-Shopify-Webhook-Id": "delivery",
+      },
+    });
+  };
+
   it("spends no budget and makes no limiter database call for forged or unauthenticated traffic", async () => {
     mocks.admin.mockRejectedValue(new Response(null, { status: 401 }));
-    mocks.webhook.mockRejectedValue(new Response(null, { status: 401 }));
     mocks.login.mockResolvedValue({});
     for (let i = 0; i < 25; i++) {
       expect(await authenticate.admin(forged("/app")).catch(status)).toBe(401);
@@ -262,14 +284,14 @@ describe("Shopify request wrappers", () => {
         await authenticate
           .webhook(
             forged("/webhooks/products/update", { method: "POST", body: "{}" }),
+            ["PRODUCTS_UPDATE"],
           )
           .catch(status),
       ).toBe(401);
       await login(forged("/auth/login"));
     }
     expect(mocks.admin).toHaveBeenCalledTimes(25);
-    expect(mocks.webhook).toHaveBeenCalledTimes(25);
-    expect(login).toBe(mocks.login);
+    expect(mocks.login).toHaveBeenCalledTimes(25);
     expect(mocks.query).not.toHaveBeenCalled();
     expect(mocks.execute).not.toHaveBeenCalled();
   });
@@ -281,13 +303,8 @@ describe("Shopify request wrappers", () => {
       rateLimitKey("shop:read", shop),
       rateLimitKey("user:read", JSON.stringify([shop, "7"])),
     ]);
-    const delivery = () =>
-      new Request("https://app.test/webhooks", { method: "POST" });
-    mocks.webhook
-      .mockResolvedValueOnce({ shop, topic: "PRODUCTS_UPDATE" })
-      .mockResolvedValueOnce({ shop, topic: "APP_UNINSTALLED" });
-    await authenticate.webhook(delivery());
-    await authenticate.webhook(delivery());
+    await authenticate.webhook(signed("products/update"), ["PRODUCTS_UPDATE"]);
+    await authenticate.webhook(signed("app/uninstalled"), ["APP_UNINSTALLED"]);
     expect(mocks.query).toHaveBeenCalledTimes(3);
     expect(mocks.query.mock.calls[2][1]).toBe(
       rateLimitKey("webhook:catalog", shop),
@@ -301,11 +318,13 @@ describe("Shopify request wrappers", () => {
         .admin(new Request("https://app.test/app"))
         .catch(status),
     ).toBe(503);
-    mocks.webhook.mockResolvedValueOnce({ shop, topic: "PRODUCTS_UPDATE" });
-    expect(await authenticate.webhook(delivery()).catch(status)).toBe(503);
-    mocks.webhook.mockResolvedValueOnce({ shop, topic: "SHOP_REDACT" });
-    await expect(authenticate.webhook(delivery())).resolves.toMatchObject({
-      topic: "SHOP_REDACT",
-    });
+    expect(
+      await authenticate
+        .webhook(signed("products/update"), ["PRODUCTS_UPDATE"])
+        .catch(status),
+    ).toBe(503);
+    await expect(
+      authenticate.webhook(signed("shop/redact"), ["SHOP_REDACT"]),
+    ).resolves.toMatchObject({ topic: "SHOP_REDACT" });
   });
 });

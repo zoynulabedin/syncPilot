@@ -1,6 +1,18 @@
-import type { Prisma } from "@prisma/client";
+import type { Prisma, ShopConnection } from "@prisma/client";
 import prisma from "../db.server";
 import { normalizeShop } from "../domain/guards";
+import { rejectWebhook } from "./webhook-verification.server";
+
+type Tx = Prisma.TransactionClient;
+const WEBHOOK_ACTOR = "shopify:webhook";
+/**
+ * A session token lives about a minute, so a signed-in page can follow a real
+ * uninstall by that long. Later activity shows the app was installed again.
+ */
+const SESSION_TOKEN_TOLERANCE_MS = 2 * 60_000;
+/** Shopify retries for four hours and documents deliveries up to a day late. */
+const MAX_UNINSTALL_AGE_MS = 48 * 3_600_000;
+const MAX_CLOCK_SKEW_MS = 5 * 60_000;
 
 /**
  * Standing automatic consent ends with the authority it was granted under.
@@ -38,22 +50,155 @@ export async function revokeStandingConsents(
   return revoked.map(({ id }) => id);
 }
 
+/** Serializes a lifecycle delivery with a reinstall or another delivery. */
+async function lockConnection(tx: Tx, shop: string) {
+  await tx.$queryRaw`SELECT id FROM "ShopConnection" WHERE "shopDomain" = ${shop} FOR UPDATE`;
+  return tx.shopConnection.findUnique({ where: { shopDomain: shop } });
+}
+
+/** Stops everything that writes under standing authority; the pair stays. */
+async function pauseWriteAuthority(
+  tx: Tx,
+  workspaceId: string,
+  shop: string,
+  actor: string,
+  reason: string,
+  lastError: string,
+) {
+  await revokeStandingConsents(
+    tx,
+    { workspaceId },
+    { actor, shopDomain: shop, reason },
+  );
+  await tx.syncPolicy.updateMany({
+    where: { workspaceId },
+    data: { enabled: false, status: "PAUSED" },
+  });
+  await tx.syncPreview.updateMany({
+    where: { workspaceId, status: { in: ["PENDING", "APPROVED"] } },
+    data: { status: "REVOKED" },
+  });
+  await tx.syncJob.updateMany({
+    where: {
+      workspaceId,
+      operation: { in: ["APPLY_PREVIEW", "AUTO_PREVIEW"] },
+      status: { in: ["PENDING", "RETRY", "RUNNING"] },
+    },
+    data: {
+      status: "CANCELLED",
+      leaseUntil: null,
+      leaseOwner: null,
+      lastError,
+    },
+  });
+}
+
+/** One row per event: a repeated delivery of it adds nothing to the trail. */
+async function auditIgnoredDelivery(
+  tx: Tx,
+  connection: ShopConnection,
+  actor: string,
+  action: string,
+  deliveredFor: Date,
+  details: Record<string, string | undefined>,
+) {
+  const iso = deliveredFor.toISOString();
+  const seen = await tx.auditEvent.findFirst({
+    where: {
+      shopDomain: connection.shopDomain,
+      action,
+      details: { path: ["deliveredFor"], equals: iso },
+    },
+    select: { id: true },
+  });
+  if (seen) return;
+  await tx.auditEvent.create({
+    data: {
+      workspaceId: connection.workspaceId,
+      shopDomain: connection.shopDomain,
+      actor,
+      action,
+      resourceType: "ShopConnection",
+      resourceId: connection.id,
+      details: { deliveredFor: iso, ...details },
+    },
+  });
+}
+
+/**
+ * Arrival order means nothing: Shopify retries a failed delivery for hours. The
+ * first check mirrors the reinstall guard in privacy.server.ts. The second is
+ * for an uninstall the app never processed, which leaves no reinstall to see:
+ * the delivery failed, the merchant reinstalled and opened the app, and only
+ * then did the retry arrive. Either way this store is live and keeps its sessions.
+ */
+function staleUninstall(connection: ShopConnection, triggeredAt: Date) {
+  if (connection.status !== "CONNECTED" || connection.uninstalledAt)
+    return null;
+  if (triggeredAt < connection.installedAt) return "OLDER_THAN_INSTALLATION";
+  return triggeredAt.getTime() <
+    connection.lastSeenAt.getTime() - SESSION_TOKEN_TOLERANCE_MS
+    ? "OLDER_THAN_SIGNED_IN_ACTIVITY"
+    : null;
+}
+
 /** Called only after Shopify's webhook authenticator verifies the body. */
-export async function revokeInstallation(shopDomain: string) {
+export async function revokeInstallation(
+  shopDomain: string,
+  delivery: { triggeredAt?: Date; webhookId?: string; eventId?: string } = {},
+) {
   const shop = normalizeShop(shopDomain);
+  const { triggeredAt, webhookId, eventId } = delivery;
   return prisma.$transaction(async (tx) => {
-    const connection = await tx.shopConnection.findUnique({
-      where: { shopDomain: shop },
-    });
+    const connection = await lockConnection(tx, shop);
+    if (connection && triggeredAt) {
+      // A repeat of the uninstall already handled. Moving uninstalledAt would
+      // also make the erasure guard hold a redaction it has already received.
+      if (connection.uninstalledAt && triggeredAt <= connection.uninstalledAt)
+        return { revoked: false, reason: "ALREADY_UNINSTALLED" };
+      const stale = staleUninstall(connection, triggeredAt);
+      if (stale) {
+        // Authority granted before an uninstall the app never saw ends with it.
+        if (stale === "OLDER_THAN_SIGNED_IN_ACTIVITY" && connection.workspaceId)
+          await pauseWriteAuthority(
+            tx,
+            connection.workspaceId,
+            shop,
+            WEBHOOK_ACTOR,
+            "APP_UNINSTALLED",
+            "UNINSTALLED: The store was uninstalled and reinstalled. Review and approve a new plan.",
+          );
+        await auditIgnoredDelivery(
+          tx,
+          connection,
+          WEBHOOK_ACTOR,
+          "APP_UNINSTALL_IGNORED",
+          triggeredAt,
+          { reason: stale, webhookId, eventId },
+        );
+        return { revoked: false, reason: stale };
+      }
+    }
+    if (
+      triggeredAt &&
+      (Date.now() - triggeredAt.getTime() > MAX_UNINSTALL_AGE_MS ||
+        triggeredAt.getTime() - Date.now() > MAX_CLOCK_SKEW_MS)
+    )
+      throw rejectWebhook("WEBHOOK_DELIVERY_TIME_INVALID", {
+        topic: "APP_UNINSTALLED",
+        shop,
+      });
     const workspaceId = connection?.workspaceId;
     // Lifecycle cleanup is independent of the presence of an offline session:
     // Shopify may deliver an uninstall again after tokens have been removed.
     await tx.session.deleteMany({ where: { shop } });
+    const now = new Date();
     await tx.shopConnection.updateMany({
       where: { shopDomain: shop },
       data: {
         status: "UNINSTALLED",
-        uninstalledAt: new Date(),
+        // Not before the event, so a repeat of it is always recognized above.
+        uninstalledAt: triggeredAt && triggeredAt > now ? triggeredAt : now,
         workspaceId: null,
       },
     });
@@ -62,7 +207,7 @@ export async function revokeInstallation(shopDomain: string) {
         tx,
         { workspaceId },
         {
-          actor: "shopify:webhook",
+          actor: WEBHOOK_ACTOR,
           shopDomain: shop,
           reason: "APP_UNINSTALLED",
         },
@@ -121,76 +266,149 @@ export async function revokeInstallation(shopDomain: string) {
         data: {
           workspaceId,
           shopDomain: shop,
-          actor: "shopify:webhook",
+          actor: WEBHOOK_ACTOR,
           action: "APP_UNINSTALLED",
           resourceType: "ShopConnection",
           resourceId: connection?.id,
+          details: {
+            triggeredAt: triggeredAt?.toISOString(),
+            webhookId,
+            eventId,
+          },
         },
       });
+    return { revoked: true };
   });
 }
 
+/**
+ * A store comes back when Shopify has issued it new sessions. A page that
+ * authenticated just before an uninstall committed finds them deleted and must
+ * not bring the store back. Reinstalling starts a new installation, which is
+ * what older lifecycle deliveries are compared with, and nothing checked or
+ * granted for the previous one still holds.
+ */
+export async function reactivateInstallation(shop: string) {
+  return prisma.$transaction(async (tx) => {
+    const connection = await lockConnection(tx, shop);
+    if (!connection) return null;
+    if (
+      (connection.status === "CONNECTED" && !connection.uninstalledAt) ||
+      !(await tx.session.count({ where: { shop } }))
+    )
+      return connection;
+    const now = new Date();
+    await tx.auditEvent.create({
+      data: {
+        shopDomain: shop,
+        actor: "shopify:session",
+        action: "APP_REINSTALLED",
+        resourceType: "ShopConnection",
+        resourceId: connection.id,
+      },
+    });
+    return tx.shopConnection.update({
+      where: { shopDomain: shop },
+      data: {
+        status: "CONNECTED",
+        uninstalledAt: null,
+        installedAt: now,
+        lastSeenAt: now,
+        verifiedAt: null,
+        scopes: null,
+        scopesUpdatedAt: null,
+        lastError: null,
+      },
+    });
+  });
+}
+
+const shopGidOf = (id: string | number | undefined) =>
+  id === undefined || String(id).startsWith("gid://")
+    ? id
+    : `gid://shopify/Shop/${id}`;
+
+/**
+ * Shopify documents no ordering, so the payload's signed updated_at decides. The
+ * body names the store only by shop_id: it is checked once a catalog import or
+ * verification has recorded this store's ID, and cannot be before that. `actor`
+ * is who found the change, for a caller that is not Shopify's webhook.
+ */
 export async function updateInstallationScopes(
   shopDomain: string,
   current: string[],
+  delivery: {
+    updatedAt?: Date;
+    shopId?: string | number;
+    webhookId?: string;
+    actor?: string;
+  } = {},
 ) {
   const shop = normalizeShop(shopDomain);
+  const { updatedAt, webhookId, actor = WEBHOOK_ACTOR } = delivery;
+  const signedShop = shopGidOf(delivery.shopId);
   return prisma.$transaction(async (tx) => {
     const scope = [...new Set(current)].sort().join(",");
+    const connection = await lockConnection(tx, shop);
+    if (connection?.shopGid && signedShop && signedShop !== connection.shopGid)
+      throw rejectWebhook("WEBHOOK_SHOP_MISMATCH", {
+        topic: "APP_SCOPES_UPDATE",
+        shop,
+      });
+    if (connection && updatedAt) {
+      const applied = connection.scopesUpdatedAt;
+      if (
+        applied?.getTime() === updatedAt.getTime() &&
+        connection.scopes === scope
+      )
+        return { applied: false, reason: "DUPLICATE" };
+      const stale =
+        updatedAt < connection.installedAt
+          ? "OLDER_THAN_INSTALLATION"
+          : applied && updatedAt < applied
+            ? "OLDER_THAN_LAST_APPLIED"
+            : null;
+      if (stale) {
+        await auditIgnoredDelivery(
+          tx,
+          connection,
+          actor,
+          "SCOPES_UPDATE_IGNORED",
+          updatedAt,
+          { reason: stale, webhookId },
+        );
+        return { applied: false, reason: stale };
+      }
+    }
     await tx.session.updateMany({ where: { shop }, data: { scope } });
     await tx.shopConnection.updateMany({
       where: { shopDomain: shop },
-      data: { scopes: scope },
+      data: { scopes: scope, scopesUpdatedAt: updatedAt ?? new Date() },
     });
-    const connection = await tx.shopConnection.findUnique({
-      where: { shopDomain: shop },
-    });
-    if (connection?.workspaceId) {
-      await revokeStandingConsents(
+    if (connection?.workspaceId)
+      await pauseWriteAuthority(
         tx,
-        { workspaceId: connection.workspaceId },
-        {
-          actor: "shopify:webhook",
-          shopDomain: shop,
-          reason: "SCOPES_CHANGED",
-        },
+        connection.workspaceId,
+        shop,
+        actor,
+        "SCOPES_CHANGED",
+        "SCOPES_CHANGED: Revalidate permissions and approve a new plan.",
       );
-      await tx.syncPolicy.updateMany({
-        where: { workspaceId: connection.workspaceId },
-        data: { enabled: false, status: "PAUSED" },
-      });
-      await tx.syncPreview.updateMany({
-        where: {
-          workspaceId: connection.workspaceId,
-          status: { in: ["PENDING", "APPROVED"] },
-        },
-        data: { status: "REVOKED" },
-      });
-      await tx.syncJob.updateMany({
-        where: {
-          workspaceId: connection.workspaceId,
-          operation: { in: ["APPLY_PREVIEW", "AUTO_PREVIEW"] },
-          status: { in: ["PENDING", "RETRY", "RUNNING"] },
-        },
-        data: {
-          status: "CANCELLED",
-          leaseUntil: null,
-          leaseOwner: null,
-          lastError:
-            "SCOPES_CHANGED: Revalidate permissions and approve a new plan.",
-        },
-      });
-    }
     await tx.auditEvent.create({
       data: {
         workspaceId: connection?.workspaceId,
         shopDomain: shop,
-        actor: "shopify:webhook",
+        actor,
         action: "SCOPES_CHANGED",
         resourceType: "ShopConnection",
         resourceId: connection?.id,
-        details: { scopes: current },
+        details: {
+          scopes: current,
+          updatedAt: updatedAt?.toISOString(),
+          webhookId,
+        },
       },
     });
+    return { applied: true };
   });
 }

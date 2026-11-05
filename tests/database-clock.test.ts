@@ -101,6 +101,15 @@ describe("readiness database time zone gate", () => {
     return loader();
   };
 
+  it("does not depend on Redis, which holds no job or request state", async () => {
+    // Nothing listens here. A health-aware proxy would stop sending webhooks to
+    // this process if an outage of something it does not use failed readiness.
+    vi.stubEnv("REDIS_URL", "redis://127.0.0.1:1");
+    const response = await probe("UTC");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ status: "ready" });
+  });
+
   it("is ready when the database session uses a UTC alias", async () => {
     const response = await probe("Etc/UTC");
     expect(response.status).toBe(200);

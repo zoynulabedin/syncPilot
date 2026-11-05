@@ -2,6 +2,12 @@
 export const SHOP_QUERY = `#graphql
   query SyncPilotShop { shop { id currencyCode } }
 `;
+export const INSTALLATION_CHECK_QUERY = `#graphql
+  query SyncPilotInstallationCheck {
+    shop { id myshopifyDomain currencyCode }
+    currentAppInstallation { accessScopes { handle } }
+  }
+`;
 export const PRODUCTS_QUERY = `#graphql
   query SyncPilotProducts($after: String) {
     products(first: 100, after: $after, sortKey: ID) {

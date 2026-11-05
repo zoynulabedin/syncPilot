@@ -1,0 +1,66 @@
+# Per-IP and flood limits for SyncPilot behind Coolify's Traefik. NOT yet exercised
+# against a real proxy: load it on staging and confirm the limits before relying on it.
+#
+# Install as a Traefik dynamic configuration (Coolify: Servers > Proxy > Dynamic
+# Configurations). Replace REPLACE_WITH_STAGING_DOMAIN, and replace
+# REPLACE_WITH_WEB_SERVICE with the name the Traefik dashboard shows for the web
+# container's service, for example https-0-abc123-web. These routers have longer
+# rules than Coolify's Host-only router, so they take these paths and leave the rest.
+#
+# Behind Cloudflare, either apply equivalent rules there or set
+# sourceCriterion.ipStrategy.depth to 1, otherwise every client shares one bucket.
+#
+# The app enforces its own body caps (webhooks 10 MiB, login 4 KiB, signed-in forms
+# 64 KiB) and per-shop budgets. It never trusts forwarding headers, so it cannot
+# tell clients apart: per-IP limits exist only here.
+http:
+  middlewares:
+    syncpilot-webhook-body:
+      buffering:
+        # Must stay at or above WEBHOOK_BODY_LIMIT in app/services/request-body.server.ts.
+        maxRequestBodyBytes: 10485760
+        memRequestBodyBytes: 1048576
+    syncpilot-form-body:
+      buffering:
+        maxRequestBodyBytes: 65536
+    # Shopify delivers from a small pool of addresses. The app accepts 1,200 catalog
+    # deliveries a minute per shop, or about 40 a second across two stores; a 429
+    # here is retried by Shopify for four hours, so stay well above that.
+    syncpilot-webhook-rate:
+      rateLimit:
+        average: 100
+        burst: 200
+        period: 1s
+    # Each page load makes a few requests through token exchange.
+    syncpilot-auth-rate:
+      rateLimit:
+        average: 5
+        burst: 20
+        period: 1s
+    syncpilot-app-rate:
+      rateLimit:
+        average: 20
+        burst: 60
+        period: 1s
+  routers:
+    syncpilot-webhooks:
+      rule: Host(`REPLACE_WITH_STAGING_DOMAIN`) && PathPrefix(`/webhooks`)
+      entryPoints: [https]
+      tls:
+        certResolver: letsencrypt
+      middlewares: [syncpilot-webhook-rate, syncpilot-webhook-body]
+      service: REPLACE_WITH_WEB_SERVICE@docker
+    syncpilot-auth:
+      rule: Host(`REPLACE_WITH_STAGING_DOMAIN`) && PathPrefix(`/auth`)
+      entryPoints: [https]
+      tls:
+        certResolver: letsencrypt
+      middlewares: [syncpilot-auth-rate, syncpilot-form-body]
+      service: REPLACE_WITH_WEB_SERVICE@docker
+    syncpilot-app:
+      rule: Host(`REPLACE_WITH_STAGING_DOMAIN`) && PathPrefix(`/app`)
+      entryPoints: [https]
+      tls:
+        certResolver: letsencrypt
+      middlewares: [syncpilot-app-rate, syncpilot-form-body]
+      service: REPLACE_WITH_WEB_SERVICE@docker

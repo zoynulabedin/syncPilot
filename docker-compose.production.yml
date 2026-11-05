@@ -23,8 +23,6 @@ x-app: &app
   depends_on:
     postgres:
       condition: service_healthy
-    redis:
-      condition: service_healthy
 
 services:
   web:
@@ -32,8 +30,6 @@ services:
     expose: ["3000"]
     depends_on:
       postgres:
-        condition: service_healthy
-      redis:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
@@ -54,8 +50,6 @@ services:
     command: ["npm", "run", "worker"]
     depends_on:
       postgres:
-        condition: service_healthy
-      redis:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully

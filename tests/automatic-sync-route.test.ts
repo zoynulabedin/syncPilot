@@ -193,12 +193,14 @@ describe("automatic sync loader", () => {
         enabled: false,
       });
     }
-    // Opening the page reactivates a reinstalled store, as the other pages do.
+    // Opening the page records the visit, as the other pages do. Coming back
+    // from an uninstall is decided separately, against the store's sessions.
     expect(upsert).toHaveBeenCalledTimes(2);
     for (const [query] of upsert.mock.calls)
-      expect(query).toMatchObject({
+      expect(query).toEqual({
         where: { shopDomain: shop },
-        update: { status: "CONNECTED", uninstalledAt: null },
+        create: { shopDomain: shop },
+        update: { lastSeenAt: expect.any(Date) },
       });
   });
 

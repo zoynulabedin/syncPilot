@@ -1001,6 +1001,263 @@ integration("durable synchronization PostgreSQL worker", () => {
     );
     expect(api.request).not.toHaveBeenCalled();
   });
+  describe("webhook events and the comparisons they queue", () => {
+    const eventFixture = async () => {
+      const f = await pairFixture();
+      // Only the deliveries under test should be claimable.
+      await prisma.syncJob.update({
+        where: { id: f.job.id },
+        data: { status: "CANCELLED" },
+      });
+      const live = liveApi(f);
+      const handler = async (
+        shop: string,
+        doc: string,
+        variables: Record<string, unknown> = {},
+      ) => {
+        const catalog = shop === f.sourceShop ? f.source : f.target;
+        return /SyncPilot(Products|Variants|Locations|InventoryLevels)\b/.test(
+          doc,
+        )
+          ? catalogApi(catalog.products, catalog.variants)(shop, doc, variables)
+          : live(shop, doc, variables);
+      };
+      api.request.mockImplementation(handler);
+      return { ...f, handler };
+    };
+    const deliver = (
+      shop: string,
+      topic: string,
+      resourceId: string,
+      id = `${topic}-${++sequence}`,
+    ) =>
+      recordVerifiedWebhook(
+        new Request("https://fixture.invalid", {
+          headers: { "x-shopify-webhook-id": id },
+        }),
+        shop,
+        topic,
+        resourceId,
+      );
+    const event = (id: string) =>
+      prisma.webhookEvent.findUniqueOrThrow({ where: { id } });
+    const comparisons = (policyId: string) =>
+      prisma.syncJob.findMany({
+        where: { policyId, operation: "RECONCILE" },
+        orderBy: { createdAt: "asc" },
+      });
+    /** Claims and runs every job that is currently due. */
+    async function drain() {
+      for (let i = 0; i < 25; i++) {
+        await dispatchInbox();
+        const result = await runWorkerOnce(`event-worker-${sequence}`);
+        if (!result.processed) return;
+      }
+      throw new Error("The queue did not drain");
+    }
+
+    it("leaves a processed event alone when the comparison it queued fails, and through the retry", async () => {
+      const f = await eventFixture();
+      const delivered = await deliver(f.sourceShop, "PRODUCTS_UPDATE", "100");
+      const throttled = async (
+        shop: string,
+        doc: string,
+        variables?: Record<string, unknown>,
+      ) => {
+        if (doc.includes("SyncPilotResources"))
+          throw new SyncError("THROTTLED", "Slow down.", true);
+        return f.handler(shop, doc, variables);
+      };
+      api.request.mockImplementation(throttled);
+      await dispatchInbox();
+      await runWorkerOnce("event-worker");
+      expect(await event(delivered.id)).toMatchObject({
+        status: "PROCESSED",
+        lastError: null,
+      });
+      await runWorkerOnce("event-worker");
+      const [comparison] = await comparisons(f.policy.id);
+      expect(comparison).toMatchObject({
+        status: "RETRY",
+        eventId: delivered.id,
+      });
+      expect(await event(delivered.id)).toMatchObject({
+        status: "PROCESSED",
+        lastError: null,
+      });
+      // The retry succeeds and nothing has to restore the event.
+      api.request.mockImplementation(f.handler);
+      await prisma.syncJob.update({
+        where: { id: comparison.id },
+        data: { availableAt: new Date("2000-01-01") },
+      });
+      await runWorkerOnce("event-worker");
+      expect(
+        (
+          await prisma.syncJob.findUniqueOrThrow({
+            where: { id: comparison.id },
+          })
+        ).status,
+      ).toBe("SUCCEEDED");
+      expect((await event(delivered.id)).status).toBe("PROCESSED");
+      // A comparison that dead-letters does not mark the import failed either.
+      api.request.mockImplementation(async (shop, doc, variables) => {
+        if (doc.includes("SyncPilotResources"))
+          throw new SyncError("AUTH_FAILURE", "Reconnect the store.");
+        return f.handler(shop, doc, variables);
+      });
+      const second = await deliver(f.sourceShop, "PRODUCTS_UPDATE", "100");
+      await drain();
+      const latest = (await comparisons(f.policy.id)).at(-1)!;
+      expect(latest).toMatchObject({
+        status: "DEAD_LETTER",
+        eventId: second.id,
+      });
+      expect(await event(second.id)).toMatchObject({
+        status: "PROCESSED",
+        lastError: null,
+      });
+    });
+
+    it("still reports a failed refresh on its event, and clears it when a retry succeeds", async () => {
+      const f = await eventFixture();
+      const delivered = await deliver(f.sourceShop, "PRODUCTS_UPDATE", "100");
+      api.request.mockImplementation(async (shop, doc, variables) => {
+        if (doc.includes("SyncPilotProducts"))
+          throw new SyncError("THROTTLED", "Slow down.", true);
+        return f.handler(shop, doc, variables);
+      });
+      await dispatchInbox();
+      await runWorkerOnce("event-worker");
+      expect(await event(delivered.id)).toMatchObject({
+        status: "DISPATCHED",
+        lastError: "THROTTLED: Slow down.",
+      });
+      api.request.mockImplementation(f.handler);
+      await prisma.syncJob.updateMany({
+        where: { eventId: delivered.id, operation: "WEBHOOK_REFRESH" },
+        data: { availableAt: new Date("2000-01-01") },
+      });
+      await runWorkerOnce("event-worker");
+      expect(await event(delivered.id)).toMatchObject({
+        status: "PROCESSED",
+        lastError: null,
+      });
+    });
+
+    it("compares a destination edit on a mapped product against the source, and only reports it", async () => {
+      const f = await eventFixture();
+      await deliver(f.targetShop, "PRODUCTS_UPDATE", "200");
+      await drain();
+      const [comparison] = await comparisons(f.policy.id);
+      expect(comparison).toMatchObject({
+        status: "SUCCEEDED",
+        sourceShop: f.sourceShop,
+        targetShop: f.targetShop,
+      });
+      const run = await prisma.reconciliationRun.findFirstOrThrow({
+        where: { policyId: f.policy.id },
+        orderBy: { startedAt: "desc" },
+      });
+      expect(run).toMatchObject({ status: "COMPLETED", drifted: 1 });
+      expect(
+        await prisma.syncPreview.count({
+          where: {
+            policyId: f.policy.id,
+            status: "PENDING",
+            createdBy: "system",
+          },
+        }),
+      ).toBe(1);
+      for (const [, doc] of api.request.mock.calls)
+        expect(String(doc)).not.toMatch(/mutation/);
+    });
+
+    it("finds nothing to report when the destination event is the app's own write", async () => {
+      const f = await eventFixture();
+      f.target.products[0].title = f.source.products[0].title;
+      await deliver(f.targetShop, "PRODUCTS_UPDATE", "200");
+      await drain();
+      const run = await prisma.reconciliationRun.findFirstOrThrow({
+        where: { policyId: f.policy.id },
+        orderBy: { startedAt: "desc" },
+      });
+      expect(run).toMatchObject({ status: "COMPLETED", total: 0, drifted: 0 });
+      expect(
+        await prisma.syncPreview.count({
+          where: { policyId: f.policy.id, createdBy: "system" },
+        }),
+      ).toBe(0);
+    });
+
+    it("skips destination events that cannot change what the policy owns", async () => {
+      const f = await eventFixture();
+      await deliver(f.targetShop, "PRODUCTS_UPDATE", "999");
+      // This policy does not sync stock.
+      await deliver(f.targetShop, "INVENTORY_LEVELS_UPDATE", "210");
+      await drain();
+      expect(await comparisons(f.policy.id)).toHaveLength(0);
+      await prisma.syncPolicy.update({
+        where: { id: f.policy.id },
+        data: { syncInventory: true },
+      });
+      await deliver(f.targetShop, "INVENTORY_LEVELS_UPDATE", "999");
+      await drain();
+      expect(await comparisons(f.policy.id)).toHaveLength(0);
+      await deliver(f.targetShop, "INVENTORY_LEVELS_UPDATE", "210");
+      await drain();
+      expect(await comparisons(f.policy.id)).toHaveLength(1);
+    });
+
+    it("keeps one comparison waiting per policy, because it reads live state when it runs", async () => {
+      const f = await eventFixture();
+      for (let i = 0; i < 3; i++)
+        await deliver(f.sourceShop, "PRODUCTS_UPDATE", "100");
+      await dispatchInbox();
+      // Only the refresh jobs run; the comparison they queue stays waiting.
+      await prisma.syncJob.updateMany({
+        where: { operation: "RECONCILE" },
+        data: { availableAt: new Date(Date.now() + 60_000) },
+      });
+      for (let i = 0; i < 3; i++) {
+        await runWorkerOnce("event-worker");
+        await prisma.syncJob.updateMany({
+          where: { operation: "RECONCILE", status: "PENDING" },
+          data: { availableAt: new Date(Date.now() + 60_000) },
+        });
+      }
+      const waiting = await comparisons(f.policy.id);
+      expect(waiting).toHaveLength(1);
+      expect(waiting[0].status).toBe("PENDING");
+      // Once it has started, the next change needs its own comparison.
+      await prisma.syncJob.update({
+        where: { id: waiting[0].id },
+        data: { availableAt: new Date("2000-01-01") },
+      });
+      await runWorkerOnce("event-worker");
+      await deliver(f.sourceShop, "PRODUCTS_UPDATE", "100");
+      await drain();
+      expect(await comparisons(f.policy.id)).toHaveLength(2);
+    });
+
+    it("stores the merchant-action correlation with the receipt", async () => {
+      const shop = await ownShop();
+      const triggeredAt = new Date("2026-03-30T14:30:00.000Z");
+      const stored = await recordVerifiedWebhook(
+        new Request("https://fixture.invalid", {
+          headers: { "x-shopify-webhook-id": `correlated-${sequence}` },
+        }),
+        shop,
+        "PRODUCTS_UPDATE",
+        "100",
+        { eventId: "merchant-action-1", triggeredAt },
+      );
+      expect(stored).toMatchObject({
+        eventId: "merchant-action-1",
+        triggeredAt,
+      });
+    });
+  });
   it("preview hashes change for a stale imported target even if a delayed webhook carries old data", async () => {
     const f = await pairFixture();
     const original = await buildPreview(f.policy.id);

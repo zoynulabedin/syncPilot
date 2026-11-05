@@ -1,9 +1,35 @@
 import { useState } from "react";
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { Form, useActionData, useLoaderData } from "react-router";
+import type {
+  ActionFunctionArgs,
+  HeadersFunction,
+  LoaderFunctionArgs,
+} from "react-router";
+import {
+  Form,
+  isRouteErrorResponse,
+  useActionData,
+  useLoaderData,
+  useRouteError,
+} from "react-router";
 
 import { login } from "../../shopify.server";
 import { loginErrorMessage } from "./error.server";
+
+// A refused form is answered through the boundary below, which sends only the
+// headers returned here. `Connection: close` is what ends the upload.
+export const headers: HeadersFunction = ({ errorHeaders }) =>
+  errorHeaders ?? {};
+
+export function ErrorBoundary() {
+  const error = useRouteError();
+  const status = isRouteErrorResponse(error) ? error.status : 500;
+  return (
+    <>
+      <h1>Log in</h1>
+      <p>This request could not be completed ({status}). Please try again.</p>
+    </>
+  );
+}
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const errors = loginErrorMessage(await login(request));
