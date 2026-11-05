@@ -2,8 +2,13 @@ import { randomUUID } from "node:crypto";
 import { createWorkerCycle } from "./lib/worker-cycle";
 import prisma from "../app/db.server";
 import { logger } from "../app/services/logger.server";
+import {
+  databaseClockRemedy,
+  readDatabaseClock,
+} from "../app/services/database-clock.server";
 import { scheduleAutomaticSync } from "../app/services/automatic-sync.server";
 import { cleanHistory } from "../app/services/retention.server";
+import { cleanExpiredRateLimits } from "../app/services/rate-limit.server";
 import { processPrivacyRequests } from "../app/services/privacy.server";
 import {
   scheduleNotifications,
@@ -30,6 +35,7 @@ const runCycle = createWorkerCycle({
     { stage: "AUTOMATIC_SYNC", run: scheduleAutomaticSync },
     { stage: "PRIVACY", run: processPrivacyRequests },
     { stage: "RETENTION", run: cleanHistory },
+    { stage: "RATE_LIMIT_CLEANUP", run: () => cleanExpiredRateLimits() },
     { stage: "ALERT_SCHEDULING", run: scheduleNotifications },
   ],
   runJob: () => runWorkerOnce(workerId),
@@ -49,16 +55,44 @@ logger.info(
   },
   "SyncPilot worker starting",
 );
+const dependencyUnavailable = () =>
+  logger.error(
+    { workerId, code: "WORKER_DEPENDENCY_FAILURE" },
+    "Worker dependency unavailable; persisted jobs will be recovered",
+  );
+/** Waits out an unreachable database; undefined only when stopped first. */
+async function waitForDatabaseClock() {
+  while (!stopping) {
+    try {
+      return await readDatabaseClock();
+    } catch {
+      dependencyUnavailable();
+      await pause(5000);
+    }
+  }
+}
 try {
+  // Raw SQL leases and schedules compare timestamps in the session zone, so no
+  // maintenance or job may run until that zone is known to be UTC.
+  const clock = await waitForDatabaseClock();
+  if (clock && !clock.utc) {
+    logger.fatal(
+      {
+        workerId,
+        code: "DATABASE_TIME_ZONE_NOT_UTC",
+        timeZone: clock.timeZone,
+      },
+      databaseClockRemedy(clock),
+    );
+    process.exitCode = 1;
+    stopping = true;
+  }
   while (!stopping) {
     try {
       const result = await runCycle();
       if (!result.processed) await pause(1000);
     } catch {
-      logger.error(
-        { workerId, code: "WORKER_DEPENDENCY_FAILURE" },
-        "Worker dependency unavailable; persisted jobs will be recovered",
-      );
+      dependencyUnavailable();
       await pause(5000);
     }
   }
