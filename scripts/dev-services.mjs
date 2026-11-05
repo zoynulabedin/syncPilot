@@ -2,11 +2,12 @@ import { spawn } from "node:child_process";
 
 // Shopify CLI provides the same authenticated development environment to both
 // processes. The worker never depends on an open dashboard or browser session.
+// Windows only runs npm.cmd through a shell; the command is a fixed literal.
+const web = { stdio: "inherit", env: process.env };
 const processes = [
-  spawn("npm", ["exec", "react-router", "dev"], {
-    stdio: "inherit",
-    env: process.env,
-  }),
+  process.platform === "win32"
+    ? spawn("npm exec react-router dev", { ...web, shell: true })
+    : spawn("npm", ["exec", "react-router", "dev"], web),
   spawn(
     process.execPath,
     [

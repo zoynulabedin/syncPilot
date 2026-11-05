@@ -35,7 +35,9 @@ describe("authenticated backup files", () => {
       encrypted,
       key,
     );
-    expect((await stat(encrypted)).mode & 0o777).toBe(0o600);
+    // Windows has no POSIX mode bits; backups run on Linux operator hosts.
+    if (process.platform !== "win32")
+      expect((await stat(encrypted)).mode & 0o777).toBe(0o600);
     expect((await readFile(encrypted)).equals(input)).toBe(false);
     await decryptBackup(encrypted, restored, key);
     expect((await readFile(restored)).equals(input)).toBe(true);

@@ -12,6 +12,12 @@ if (mode && !["--http", "--backup"].includes(mode))
 const base = new URL(process.env.DATABASE_URL);
 if (!["localhost", "127.0.0.1", "postgres"].includes(base.hostname))
   throw new Error("Integration runner requires a local database");
+// Windows only runs npm.cmd through a shell; every npm argument below is a fixed literal.
+function npmExec(args, options) {
+  return process.platform === "win32"
+    ? spawnSync(["npm", "exec", ...args].join(" "), { ...options, shell: true })
+    : spawnSync("npm", ["exec", ...args], options);
+}
 const database = `syncpilot_test_${randomUUID().replaceAll("-", "")}`;
 const testUrl = new URL(base);
 testUrl.pathname = `/${database}`;
@@ -27,7 +33,7 @@ const env = {
 let code = 1;
 try {
   await admin.$executeRawUnsafe(`CREATE DATABASE "${database}"`);
-  const migrate = spawnSync("npm", ["exec", "prisma", "migrate", "deploy"], {
+  const migrate = npmExec(["prisma", "migrate", "deploy"], {
     env,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -36,10 +42,8 @@ try {
       "Disposable database migration failed; no application database was modified",
     );
   console.log("Fresh PostgreSQL migration: PASS");
-  const parity = spawnSync(
-    "npm",
+  const parity = npmExec(
     [
-      "exec",
       "--",
       "prisma",
       "migrate",
@@ -57,15 +61,19 @@ try {
     throw new Error("Prisma schema and fresh migrations differ");
   }
   console.log("Prisma schema/migration parity: PASS");
-  const test = spawnSync(
-    mode === "--backup" ? process.execPath : "npm",
+  const test =
     mode === "--backup"
-      ? ["--import", "tsx", "scripts/verify-backup-restore.ts"]
-      : mode === "--http"
-        ? ["exec", "playwright", "test"]
-        : ["exec", "vitest", "run", "tests/integration"],
-    { env, stdio: "inherit" },
-  );
+      ? spawnSync(
+          process.execPath,
+          ["--import", "tsx", "scripts/verify-backup-restore.ts"],
+          { env, stdio: "inherit" },
+        )
+      : npmExec(
+          mode === "--http"
+            ? ["playwright", "test"]
+            : ["vitest", "run", "tests/integration"],
+          { env, stdio: "inherit" },
+        );
   code = test.status ?? 1;
 } finally {
   // Name is generated here and cannot select the configured application database.
