@@ -2,7 +2,11 @@ import { PassThrough } from "stream";
 import { renderToPipeableStream } from "react-dom/server";
 import { ServerRouter, isRouteErrorResponse } from "react-router";
 import { createReadableStreamFromReadable } from "@react-router/node";
-import { type EntryContext, type HandleErrorFunction } from "react-router";
+import {
+  type EntryContext,
+  type HandleDataRequestFunction,
+  type HandleErrorFunction,
+} from "react-router";
 import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
 import { logger, safeError } from "./services/logger.server";
@@ -28,13 +32,19 @@ export const handleError: HandleErrorFunction = (error, { request }) => {
   );
 };
 
+// What a menu click fetches is the same private data a page carries.
+export const handleDataRequest: HandleDataRequestFunction = (response) => {
+  response.headers.set("Cache-Control", "no-store");
+  return response;
+};
+
 export default async function handleRequest(
   request: Request,
   responseStatusCode: number,
   responseHeaders: Headers,
   reactRouterContext: EntryContext,
 ) {
-  addDocumentResponseHeaders(request, responseHeaders);
+  addDocumentResponseHeaders(responseHeaders);
   const userAgent = request.headers.get("user-agent");
   const callbackName = isbot(userAgent ?? "") ? "onAllReady" : "onShellReady";
 

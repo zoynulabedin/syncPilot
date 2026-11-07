@@ -17,6 +17,8 @@ export default defineConfig({
       SHOPIFY_API_SECRET:
         "synthetic-contract-test-secret-for-local-verification-only",
       SHOPIFY_APP_URL: "http://127.0.0.1:3210",
+      SCOPES:
+        "read_products,write_products,read_inventory,write_inventory,read_locations",
       SYNC_WRITE_ENABLED: "false",
       INVENTORY_WRITE_ENABLED: "false",
     },

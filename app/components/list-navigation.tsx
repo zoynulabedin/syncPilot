@@ -1,11 +1,14 @@
-import { Link, useSearchParams } from "react-router";
+import { useSearchParams } from "react-router";
 
+import { Link } from "./ui";
+
+/** The rest of the query, for a search form. Form in ui.tsx adds the store itself. */
 export function QueryFields({ exclude = [] }: { exclude?: string[] }) {
   const [params] = useSearchParams();
   return (
     <>
       {[...params]
-        .filter(([key]) => !exclude.includes(key))
+        .filter(([key]) => key !== "shop" && !exclude.includes(key))
         .map(([key, value], index) => (
           <input
             key={`${key}:${index}`}

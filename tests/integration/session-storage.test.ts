@@ -2,7 +2,10 @@ import "@shopify/shopify-api/adapters/node";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { Session } from "@shopify/shopify-api";
 import prisma from "../../app/db.server";
-import { EncryptedSessionStorage } from "../../app/services/session-storage.server";
+import {
+  EncryptedSessionStorage,
+  UnreadableSessionError,
+} from "../../app/services/session-storage.server";
 
 const integration = process.env.TEST_DATABASE_URL ? describe : describe.skip;
 integration("encrypted PostgreSQL session storage", () => {
@@ -58,7 +61,9 @@ integration("encrypted PostgreSQL session storage", () => {
       where: { id: session.id },
       data: { shop: "different-test.myshopify.com" },
     });
-    await expect(storage.loadSession(session.id)).rejects.toThrow();
+    await expect(storage.loadSession(session.id)).rejects.toBeInstanceOf(
+      UnreadableSessionError,
+    );
     await storage.deleteSession(session.id);
   });
 });

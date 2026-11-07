@@ -1,5 +1,58 @@
 import type { ReactNode } from "react";
-import { Form, Link, useNavigation } from "react-router";
+import type { FormProps, LinkProps, NavLinkProps } from "react-router";
+import {
+  Form as RouterForm,
+  Link as RouterLink,
+  NavLink as RouterNavLink,
+  useNavigation,
+  useSearchParams,
+} from "react-router";
+
+import { storePath } from "../domain/store-binding";
+
+/** Polaris web components, on their own: App Bridge only works inside the admin. */
+export const POLARIS_SCRIPT = "https://cdn.shopify.com/shopifycloud/polaris.js";
+
+/** The store this tab is on, which its own address says. See domain/store-binding. */
+export function useStore() {
+  const [params] = useSearchParams();
+  return params.get("shop");
+}
+
+/**
+ * The dashboard's links and forms keep the tab on its store, so that one browser can
+ * have two stores open and each tab goes on acting on its own. React Router's plain
+ * ones would lose the store: the server would then open another store's page for a
+ * link, and refuse a form outright. tests/admin-auth.test.ts keeps them out of the app.
+ */
+export function Link({ to, ...props }: Omit<LinkProps, "to"> & { to: string }) {
+  return <RouterLink to={storePath(to, useStore())} {...props} />;
+}
+
+export function NavLink({
+  to,
+  ...props
+}: Omit<NavLinkProps, "to"> & { to: string }) {
+  return <RouterNavLink to={storePath(to, useStore())} {...props} />;
+}
+
+/**
+ * A form with no action posts to the address it is on, store included. A search form
+ * replaces the query with its fields, so there the store has to be one of them.
+ */
+export function Form({ children, action, ...props }: FormProps) {
+  const store = useStore();
+  const search = !props.method || props.method.toLowerCase() === "get";
+  return (
+    <RouterForm
+      {...props}
+      action={action === undefined ? action : storePath(action, store)}
+    >
+      {search && store && <input type="hidden" name="shop" value={store} />}
+      {children}
+    </RouterForm>
+  );
+}
 
 export function Page({
   title,

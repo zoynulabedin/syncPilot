@@ -1,10 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import {
-  Form,
-  useActionData,
-  useLoaderData,
-  useRevalidator,
-} from "react-router";
+import { useActionData, useLoaderData, useRevalidator } from "react-router";
 import { authenticate } from "../shopify.server";
 import { requireActor } from "../services/authorization.server";
 import {
@@ -17,6 +12,7 @@ import {
   verifyStore,
 } from "../services/control-plane.server";
 import {
+  pageLoader,
   readActionForm,
   actionFailure,
   checked,
@@ -25,6 +21,7 @@ import {
 import {
   EmptyState,
   Field,
+  Form,
   InlineAction,
   Notice,
   Page,
@@ -36,9 +33,9 @@ import {
   Time,
 } from "../components/ui";
 
-export async function loader({ request }: LoaderFunctionArgs) {
+export const loader = pageLoader(async ({ request }: LoaderFunctionArgs) => {
   return getStores(requireActor(await authenticate.admin(request)));
-}
+});
 
 export async function action({ request }: ActionFunctionArgs) {
   const actor = requireActor(await authenticate.admin(request));
@@ -145,7 +142,7 @@ export default function Stores() {
             "Store",
             "Installation",
             "Pairing",
-            "Last seen",
+            "Last opened from Shopify",
             "Last verified",
             "Actions",
           ]}

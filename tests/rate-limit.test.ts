@@ -4,8 +4,8 @@ import { ApiVersion, shopifyApi } from "@shopify/shopify-api";
 import { createHmac } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// Webhook verification stays real: only Shopify's admin session strategy and the
-// database are replaced, so these wrappers run the library's actual HMAC check.
+// Webhook verification stays real: only sign-in and the database are replaced,
+// so these wrappers run the library's actual HMAC check.
 const mocks = vi.hoisted(() => {
   process.env.SHOPIFY_API_KEY = "test-key";
   process.env.SHOPIFY_API_SECRET = "test-secret";
@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => {
     query: vi.fn(),
     execute: vi.fn(),
     admin: vi.fn(),
+    prove: vi.fn(),
     login: vi.fn(),
   };
 });
@@ -23,8 +24,15 @@ vi.mock("@shopify/shopify-app-react-router/adapters/node", () => ({}));
 vi.mock("@shopify/shopify-app-react-router/server", () => ({
   ApiVersion: { October26: "2026-10" },
   AppDistribution: { SingleMerchant: "single_merchant" },
-  shopifyApp: () => ({
-    authenticate: { admin: mocks.admin },
+  shopifyApp: () => ({ authenticate: {} }),
+}));
+vi.mock("../app/services/admin-auth.server", () => ({
+  addDocumentResponseHeaders: vi.fn(),
+  logSignInLibraryMessage: vi.fn(),
+  assertSameOrigin: vi.fn(),
+  createAdminAuth: () => ({
+    authenticate: mocks.admin,
+    proveLive: mocks.prove,
     login: mocks.login,
   }),
 }));
@@ -326,5 +334,34 @@ describe("Shopify request wrappers", () => {
     await expect(
       authenticate.webhook(signed("shop/redact"), ["SHOP_REDACT"]),
     ).resolves.toMatchObject({ topic: "SHOP_REDACT" });
+  });
+
+  it("spends a Shopify call on a person's sign-in only once the limit has let the action through", async () => {
+    const session = { shop, userId: 7 };
+    mocks.admin.mockResolvedValue({ session });
+    const request = new Request("https://app.test/app/stores", {
+      method: "POST",
+    });
+    mocks.query.mockResolvedValueOnce([]);
+    expect(await authenticate.admin(request).catch(status)).toBe(429);
+    expect(mocks.prove).not.toHaveBeenCalled();
+
+    mocks.query.mockResolvedValue([{ count: 1 }]);
+    const allowed = new Request("https://app.test/app/stores", {
+      method: "POST",
+    });
+    await authenticate.admin(allowed);
+    expect(mocks.prove).toHaveBeenCalledWith(allowed, session);
+  });
+
+  it("does not run an action Shopify would not confirm", async () => {
+    const session = { shop, userId: 7 };
+    mocks.admin.mockResolvedValue({ session });
+    mocks.prove.mockRejectedValueOnce(new Response(null, { status: 503 }));
+    expect(
+      await authenticate
+        .admin(new Request("https://app.test/app", { method: "POST" }))
+        .catch(status),
+    ).toBe(503);
   });
 });

@@ -6,11 +6,13 @@ import { rejectWebhook } from "./webhook-verification.server";
 
 type Tx = Prisma.TransactionClient;
 const WEBHOOK_ACTOR = "shopify:webhook";
+const SIGN_IN_ACTOR = "shopify:sign-in";
 /**
- * A session token lives about a minute, so a signed-in page can follow a real
- * uninstall by that long. Later activity shows the app was installed again.
+ * Shopify's signature on a link or a sign-in stays valid for 90 seconds, so a signed
+ * visit can follow a real uninstall by that long. Later ones show the app was
+ * installed again.
  */
-const SESSION_TOKEN_TOLERANCE_MS = 2 * 60_000;
+const SIGNED_VISIT_TOLERANCE_MS = 2 * 60_000;
 /** Shopify retries for four hours and documents deliveries up to a day late. */
 const MAX_UNINSTALL_AGE_MS = 48 * 3_600_000;
 const MAX_CLOCK_SKEW_MS = 5 * 60_000;
@@ -24,13 +26,14 @@ const MAX_CLOCK_SKEW_MS = 5 * 60_000;
  */
 export async function revokeStandingConsents(
   tx: Prisma.TransactionClient,
-  scope: { workspaceId: string; policyId?: string },
+  scope: { workspaceId: string; policyId?: string; approvedBy?: string },
   audit: { actor: string; shopDomain: string; reason: string },
 ) {
   const revoked = await tx.automaticConsent.updateManyAndReturn({
     where: {
       workspaceId: scope.workspaceId,
       ...(scope.policyId ? { policyId: scope.policyId } : {}),
+      ...(scope.approvedBy ? { approvedBy: scope.approvedBy } : {}),
       status: { in: ["ACTIVE", "HELD"] },
     },
     data: { status: "REVOKED", revokedAt: new Date() },
@@ -138,9 +141,76 @@ function staleUninstall(connection: ShopConnection, triggeredAt: Date) {
     return null;
   if (triggeredAt < connection.installedAt) return "OLDER_THAN_INSTALLATION";
   return triggeredAt.getTime() <
-    connection.lastSeenAt.getTime() - SESSION_TOKEN_TOLERANCE_MS
+    connection.lastSeenAt.getTime() - SIGNED_VISIT_TOLERANCE_MS
     ? "OLDER_THAN_SIGNED_IN_ACTIVITY"
     : null;
+}
+
+/**
+ * Shopify just vouched for this store: it signed a link to the app or a sign-in,
+ * and it does neither for an app that is not installed. This time decides whether
+ * a late uninstall is older than the store's current installation, so a page
+ * opened on a session cookie must not move it: that cookie outlives an uninstall
+ * until the delivery arrives, and would make the delivery look stale.
+ */
+export async function recordSignedVisit(shop: string) {
+  await prisma.shopConnection.updateMany({
+    where: { shopDomain: shop, status: "CONNECTED", uninstalledAt: null },
+    data: { lastSeenAt: await databaseNow() },
+  });
+}
+
+/**
+ * Shopify says who owns a store only when it grants a sign-in, and an owner's
+ * WorkspaceMember row, made at pairing, changes for nothing else. So a grant saying
+ * this person is not the owner ends what that row carried: the consents they gave
+ * here, and through the row itself the plans they approved, which the write path
+ * rechecks against it. The other store's owner keeps theirs. The row stops being
+ * OWNER, or setMember could not give this person staff access later.
+ */
+export async function endFormerOwnerAuthority(shop: string, userId: string) {
+  return prisma.$transaction(async (tx) => {
+    const ended = await tx.workspaceMember.updateManyAndReturn({
+      where: { shopDomain: shop, userId, role: "OWNER", status: "ACTIVE" },
+      data: { role: "VIEWER", status: "REVOKED" },
+      select: { id: true, workspaceId: true },
+    });
+    for (const { id, workspaceId } of ended) {
+      const revoked = await revokeStandingConsents(
+        tx,
+        { workspaceId, approvedBy: `${shop}:${userId}` },
+        { actor: SIGN_IN_ACTOR, shopDomain: shop, reason: "OWNER_ROLE_ENDED" },
+      );
+      if (revoked.length)
+        await tx.syncJob.updateMany({
+          where: {
+            workspaceId,
+            status: { in: ["PENDING", "RETRY", "RUNNING"] },
+            OR: revoked.map((consentId) => ({
+              payload: { path: ["consentId"], equals: consentId },
+            })),
+          },
+          data: {
+            status: "CANCELLED",
+            leaseUntil: null,
+            leaseOwner: null,
+            lastError: "AUTOMATIC_CONSENT_REVOKED",
+          },
+        });
+      await tx.auditEvent.create({
+        data: {
+          workspaceId,
+          shopDomain: shop,
+          actor: SIGN_IN_ACTOR,
+          action: "OWNER_ROLE_ENDED",
+          resourceType: "WorkspaceMember",
+          resourceId: id,
+          details: { userId },
+        },
+      });
+    }
+    return ended.length;
+  });
 }
 
 /** Called only after Shopify's webhook authenticator verifies the body. */

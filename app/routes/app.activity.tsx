@@ -1,11 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import {
-  Form,
-  Link,
-  useActionData,
-  useLoaderData,
-  useRevalidator,
-} from "react-router";
+import { useActionData, useLoaderData, useRevalidator } from "react-router";
 import { authenticate } from "../shopify.server";
 import { Pagination, QueryFields } from "../components/list-navigation";
 import { requireActor } from "../services/authorization.server";
@@ -15,6 +9,7 @@ import {
   retryJob,
 } from "../services/control-plane.server";
 import {
+  pageLoader,
   readActionForm,
   actionFailure,
   textField,
@@ -22,8 +17,10 @@ import {
 import {
   EmptyState,
   Field,
+  Form,
   Gid,
   InlineAction,
+  Link,
   Notice,
   Page,
   ReadOnly,
@@ -33,7 +30,7 @@ import {
   Time,
 } from "../components/ui";
 
-export async function loader({ request }: LoaderFunctionArgs) {
+export const loader = pageLoader(async ({ request }: LoaderFunctionArgs) => {
   const actor = requireActor(await authenticate.admin(request));
   const url = new URL(request.url);
   const operations = await getOperations(actor, url.searchParams);
@@ -42,7 +39,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     filter: url.searchParams.get("status") || "",
     selectedJob: url.searchParams.get("job") || "",
   };
-}
+});
 
 export async function action({ request }: ActionFunctionArgs) {
   const actor = requireActor(await authenticate.admin(request));

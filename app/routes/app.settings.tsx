@@ -1,5 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { Form, Link, useActionData, useLoaderData } from "react-router";
+import { useActionData, useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
 import { Pagination } from "../components/list-navigation";
 import { operationalCounts } from "../services/notifications.server";
@@ -13,6 +13,7 @@ import {
   updateSettings,
 } from "../services/control-plane.server";
 import {
+  pageLoader,
   readActionForm,
   actionFailure,
   checked,
@@ -22,6 +23,8 @@ import {
 import {
   EmptyState,
   Field,
+  Form,
+  Link,
   Notice,
   Page,
   ReadOnly,
@@ -32,7 +35,7 @@ import {
   Time,
 } from "../components/ui";
 
-export async function loader({ request }: LoaderFunctionArgs) {
+export const loader = pageLoader(async ({ request }: LoaderFunctionArgs) => {
   const actor = requireActor(await authenticate.admin(request));
   const [settings, operations, membership] = await Promise.all([
     getSettings(actor),
@@ -54,7 +57,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     alerts,
     observedNow: (await databaseNow()).getTime(),
   };
-}
+});
 export async function action({ request }: ActionFunctionArgs) {
   const actor = requireActor(await authenticate.admin(request));
   const form = await readActionForm(request);

@@ -165,6 +165,20 @@ export async function cleanWorkspaceHistory(workspaceId: string, at?: Date) {
   );
 }
 
+/**
+ * A lapsed sign-in is a dead token next to a person's name and email, and each sign-in
+ * makes a new row, so a store nobody signs in to again would keep them until it is
+ * uninstalled. Not a workspace's retention choice: nothing is lost with these. `expires`
+ * was stamped by whichever clock took the sign-in, so a day's grace covers a skewed one.
+ */
+export async function cleanLapsedSignIns(at?: Date) {
+  const now = at ?? (await databaseNow());
+  const { count } = await prisma.session.deleteMany({
+    where: { isOnline: true, expires: { lt: new Date(now.getTime() - day) } },
+  });
+  return count;
+}
+
 export async function cleanHistory(at?: Date) {
   const now = at ?? (await databaseNow());
   const workspaces = await prisma.workspace.findMany({

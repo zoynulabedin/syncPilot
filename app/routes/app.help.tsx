@@ -1,12 +1,12 @@
 import type { LoaderFunctionArgs } from "react-router";
-import { Link } from "react-router";
 import { authenticate } from "../shopify.server";
-import { Page, Section } from "../components/ui";
+import { pageLoader } from "../components/actions.server";
+import { Link, Page, Section } from "../components/ui";
 
-export async function loader({ request }: LoaderFunctionArgs) {
+export const loader = pageLoader(async ({ request }: LoaderFunctionArgs) => {
   await authenticate.admin(request);
   return null;
-}
+});
 export default function Help() {
   return (
     <Page

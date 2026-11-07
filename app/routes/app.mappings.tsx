@@ -1,5 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { Form, Link, useActionData, useLoaderData } from "react-router";
+import { useActionData, useLoaderData } from "react-router";
 import { useState } from "react";
 import { Pagination, QueryFields } from "../components/list-navigation";
 import { authenticate } from "../shopify.server";
@@ -10,6 +10,7 @@ import {
   saveMapping,
 } from "../services/control-plane.server";
 import {
+  pageLoader,
   readActionForm,
   actionFailure,
   checked,
@@ -18,7 +19,9 @@ import {
 import {
   EmptyState,
   Field,
+  Form,
   Gid,
+  Link,
   Notice,
   Page,
   ReadOnly,
@@ -29,13 +32,13 @@ import {
   Time,
 } from "../components/ui";
 
-export async function loader({ request }: LoaderFunctionArgs) {
+export const loader = pageLoader(async ({ request }: LoaderFunctionArgs) => {
   const result = await getMappings(
     requireActor(await authenticate.admin(request)),
     new URL(request.url).searchParams,
   );
   return result;
-}
+});
 
 export async function action({ request }: ActionFunctionArgs) {
   const actor = requireActor(await authenticate.admin(request));

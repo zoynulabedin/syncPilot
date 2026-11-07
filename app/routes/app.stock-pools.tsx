@@ -1,7 +1,7 @@
 import { assertStockConserved } from "../domain/stock-ledger";
 import { randomUUID } from "node:crypto";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { Form, Link, useActionData, useLoaderData } from "react-router";
+import { useActionData, useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
 import { requireActor } from "../services/authorization.server";
 import {
@@ -13,6 +13,7 @@ import {
   reserveStock,
 } from "../services/stock-ledger.server";
 import {
+  pageLoader,
   actionFailure,
   checked,
   numberField,
@@ -22,6 +23,8 @@ import {
 import {
   EmptyState,
   Field,
+  Form,
+  Link,
   Notice,
   Page,
   ReadOnly,
@@ -31,7 +34,7 @@ import {
   Time,
 } from "../components/ui";
 
-export async function loader({ request }: LoaderFunctionArgs) {
+export const loader = pageLoader(async ({ request }: LoaderFunctionArgs) => {
   const actor = requireActor(await authenticate.admin(request));
   const url = new URL(request.url);
   return {
@@ -42,7 +45,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     )),
     actionKey: randomUUID(),
   };
-}
+});
 
 export async function action({ request }: ActionFunctionArgs) {
   const actor = requireActor(await authenticate.admin(request));

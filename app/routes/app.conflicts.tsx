@@ -1,5 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { Form, Link, useActionData, useLoaderData } from "react-router";
+import { useActionData, useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
 import { requireActor } from "../services/authorization.server";
 import {
@@ -8,6 +8,7 @@ import {
   resolveConflict,
 } from "../services/control-plane.server";
 import {
+  pageLoader,
   readActionForm,
   actionFailure,
   textField,
@@ -17,7 +18,9 @@ import { Pagination, QueryFields } from "../components/list-navigation";
 import {
   EmptyState,
   Field,
+  Form,
   Gid,
+  Link,
   Notice,
   Page,
   ReadOnly,
@@ -28,7 +31,7 @@ import {
   Time,
 } from "../components/ui";
 
-export async function loader({ request }: LoaderFunctionArgs) {
+export const loader = pageLoader(async ({ request }: LoaderFunctionArgs) => {
   const actor = requireActor(await authenticate.admin(request));
   const params = new URL(request.url).searchParams;
   const filter = params.get("conflictStatus") ?? params.get("status") ?? "OPEN";
@@ -44,7 +47,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     policies,
     filter,
   };
-}
+});
 export async function action({ request }: ActionFunctionArgs) {
   const actor = requireActor(await authenticate.admin(request));
   const form = await readActionForm(request);

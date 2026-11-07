@@ -3,6 +3,7 @@ export type MaintenanceStage =
   | "AUTOMATIC_SYNC"
   | "PRIVACY"
   | "RETENTION"
+  | "SIGN_IN_CLEANUP"
   | "RATE_LIMIT_CLEANUP"
   | "ALERT_SCHEDULING";
 

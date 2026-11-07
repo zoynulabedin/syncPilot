@@ -8,7 +8,10 @@ import {
   readDatabaseClock,
 } from "../app/services/database-clock.server";
 import { scheduleAutomaticSync } from "../app/services/automatic-sync.server";
-import { cleanHistory } from "../app/services/retention.server";
+import {
+  cleanHistory,
+  cleanLapsedSignIns,
+} from "../app/services/retention.server";
 import { cleanExpiredRateLimits } from "../app/services/rate-limit.server";
 import { processPrivacyRequests } from "../app/services/privacy.server";
 import {
@@ -36,6 +39,7 @@ const runCycle = createWorkerCycle({
     { stage: "AUTOMATIC_SYNC", run: scheduleAutomaticSync },
     { stage: "PRIVACY", run: processPrivacyRequests },
     { stage: "RETENTION", run: cleanHistory },
+    { stage: "SIGN_IN_CLEANUP", run: cleanLapsedSignIns },
     { stage: "RATE_LIMIT_CLEANUP", run: () => cleanExpiredRateLimits() },
     { stage: "ALERT_SCHEDULING", run: scheduleNotifications },
   ],

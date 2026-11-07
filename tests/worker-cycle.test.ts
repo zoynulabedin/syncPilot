@@ -1,9 +1,16 @@
 import type { PrismaClient } from "@prisma/client";
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { createWorkerCycle } from "../scripts/lib/worker-cycle";
 import { cleanExpiredRateLimits } from "../app/services/rate-limit.server";
 
 describe("worker maintenance isolation", () => {
+  it("the worker clears lapsed sign-ins on its maintenance cadence", () => {
+    expect(readFileSync("scripts/worker.ts", "utf8")).toContain(
+      '{ stage: "SIGN_IN_CLEANUP", run: cleanLapsedSignIns }',
+    );
+  });
+
   it("keeps processing jobs and other maintenance after a persistent housekeeping failure, with bounded retry cadence", async () => {
     let now = 0;
     const broken = vi.fn(async () => {

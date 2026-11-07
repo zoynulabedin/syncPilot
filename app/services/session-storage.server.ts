@@ -7,6 +7,9 @@ import {
   validateTokenEncryption,
 } from "./token-crypto.server";
 
+/** The row is there and this key cannot open it. Nothing else raises this. */
+export class UnreadableSessionError extends Error {}
+
 export class EncryptedSessionStorage extends PrismaSessionStorage<PrismaClient> {
   constructor(client: PrismaClient) {
     validateTokenEncryption();
@@ -26,14 +29,18 @@ export class EncryptedSessionStorage extends PrismaSessionStorage<PrismaClient> 
   }
 
   private decrypt(session: Session): Session {
-    session.accessToken = decryptToken(
-      session.accessToken,
-      `${session.shop}:${session.id}:access`,
-    );
-    session.refreshToken = decryptToken(
-      session.refreshToken,
-      `${session.shop}:${session.id}:refresh`,
-    );
+    try {
+      session.accessToken = decryptToken(
+        session.accessToken,
+        `${session.shop}:${session.id}:access`,
+      );
+      session.refreshToken = decryptToken(
+        session.refreshToken,
+        `${session.shop}:${session.id}:refresh`,
+      );
+    } catch {
+      throw new UnreadableSessionError("A stored session cannot be decrypted.");
+    }
     return session;
   }
 

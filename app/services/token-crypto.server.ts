@@ -1,4 +1,9 @@
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHmac,
+  randomBytes,
+} from "node:crypto";
 
 const PREFIX = "enc:v1:";
 
@@ -18,6 +23,21 @@ function key(): Buffer | undefined {
 
 export function validateTokenEncryption(): void {
   key();
+}
+
+/**
+ * Signs what a browser holds about its sign-ins. It belongs to this server rather
+ * than to one Shopify app, so several apps on one server can share it, and it is
+ * derived so that nothing it signs can help anyone open a stored token. Production
+ * always has one, as `key` above refuses to run there without the key behind it.
+ */
+export function cookieSigningKey(): string | undefined {
+  const secret = key();
+  return secret
+    ? createHmac("sha256", secret)
+        .update("syncpilot/sign-in-cookies/v1")
+        .digest("base64url")
+    : undefined;
 }
 
 export function encryptToken(

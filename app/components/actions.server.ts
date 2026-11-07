@@ -1,8 +1,32 @@
 import { data } from "react-router";
+import { DomainError } from "../domain/errors";
 import {
   ACTION_FORM_LIMIT,
   withBoundedBody,
 } from "../services/request-body.server";
+
+/**
+ * For a page's loader. A service refuses with a DomainError written for the person
+ * refused, and React Router shows an error's text only if it is a response: left as
+ * it is, staff with no access on a paired store would get a bare 500, logged as a
+ * server fault. A 5xx stays an error, so its details stay out of the page.
+ */
+export function pageLoader<Args extends unknown[], Result>(
+  load: (...args: Args) => Promise<Result>,
+) {
+  return async (...args: Args) => {
+    try {
+      return await load(...args);
+    } catch (error) {
+      if (error instanceof DomainError && error.status < 500)
+        throw new Response(error.message, {
+          status: error.status,
+          headers: { "Cache-Control": "no-store" },
+        });
+      throw error;
+    }
+  };
+}
 
 export async function readActionForm(request: Request): Promise<FormData> {
   const contentType = request.headers.get("Content-Type") || "";

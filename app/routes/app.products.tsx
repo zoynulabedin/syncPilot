@@ -1,11 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import {
-  Form,
-  Link,
-  useActionData,
-  useLoaderData,
-  useRevalidator,
-} from "react-router";
+import { useActionData, useLoaderData, useRevalidator } from "react-router";
 import { useEffect } from "react";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
@@ -13,6 +7,7 @@ import { canOperate, requireActor } from "../services/authorization.server";
 import { getWorkspace } from "../services/control-plane.server";
 import { importCatalog } from "../services/catalog.server";
 import {
+  pageLoader,
   readActionForm,
   actionFailure,
   textField,
@@ -20,7 +15,9 @@ import {
 import {
   EmptyState,
   Field,
+  Form,
   Gid,
+  Link,
   Notice,
   Page,
   ReadOnly,
@@ -32,7 +29,7 @@ import {
 } from "../components/ui";
 import { clampPage, parsePage } from "../components/pagination";
 
-export async function loader({ request }: LoaderFunctionArgs) {
+export const loader = pageLoader(async ({ request }: LoaderFunctionArgs) => {
   const actor = requireActor(await authenticate.admin(request));
   const { connections } = await getWorkspace(actor);
   const shops = [
@@ -109,7 +106,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     status,
     canManage: await canOperate(actor),
   };
-}
+});
 
 export async function action({ request }: ActionFunctionArgs) {
   const actor = requireActor(await authenticate.admin(request));

@@ -196,14 +196,15 @@ describe("automatic sync loader", () => {
         enabled: false,
       });
     }
-    // Opening the page records the visit, as the other pages do. Coming back
-    // from an uninstall is decided separately, against the store's sessions.
+    // Opening the page registers the store and moves nothing: the time a late
+    // uninstall is compared with comes only from visits Shopify signed. Coming
+    // back from an uninstall is decided separately, against the store's sessions.
     expect(upsert).toHaveBeenCalledTimes(2);
     for (const [query] of upsert.mock.calls)
       expect(query).toEqual({
         where: { shopDomain: shop },
         create: { shopDomain: shop },
-        update: { lastSeenAt: expect.any(Date) },
+        update: { shopDomain: shop },
       });
   });
 

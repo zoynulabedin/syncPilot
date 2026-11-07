@@ -43,6 +43,7 @@ import {
   ensureInstallation,
   initiatePairing,
 } from "../../app/services/control-plane.server";
+import { recordSignedVisit } from "../../app/services/installation.server";
 import { processPrivacyRequests } from "../../app/services/privacy.server";
 import { requireWorkspace } from "../../app/services/authorization.server";
 import type { Actor } from "../../app/services/authorization.server";
@@ -601,11 +602,13 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
       it("caps the anonymous login form far below the webhook limit", async () => {
         const form = "application/x-www-form-urlencoded";
         const declared = oversized("/auth/login", 64 * 1024, {
+          Origin: ORIGIN,
           "Content-Type": form,
           "Content-Length": String(64 * 1024),
         });
         expect(await status(login, declared.request)).toBe(413);
         const stream = oversized("/auth/login", 10 * MiB, {
+          Origin: ORIGIN,
           "Content-Type": form,
         });
         expect(await status(login, stream.request)).toBe(413);
@@ -613,7 +616,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         // An ordinary submission still reaches the library's own validation.
         const small = new Request(`${ORIGIN}/auth/login`, {
           method: "POST",
-          headers: { "Content-Type": form },
+          headers: { Origin: ORIGIN, "Content-Type": form },
           body: "shop=not%20a%20shop",
         });
         const args = {
@@ -623,13 +626,13 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
           url: new URL(small.url),
           pattern: "/auth/login",
         } as ActionFunctionArgs;
-        await expect(login(args)).resolves.toEqual({
-          errors: { shop: "Please enter a valid shop domain to log in" },
+        await expect(login(args)).resolves.toMatchObject({
+          errors: { shop: expect.stringContaining(".myshopify.com") },
         });
-        // A valid shop redirects into Shopify's install flow.
+        // A valid shop redirects into Shopify's authorization page.
         const valid = new Request(`${ORIGIN}/auth/login`, {
           method: "POST",
-          headers: { "Content-Type": form },
+          headers: { Origin: ORIGIN, "Content-Type": form },
           body: "shop=valid-store.myshopify.com",
         });
         const redirected = await login({ ...args, request: valid }).catch(
@@ -644,7 +647,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
       it("answers a login form in another encoding as a client error", async () => {
         const request = new Request(`${ORIGIN}/auth/login`, {
           method: "POST",
-          headers: { "Content-Type": "text/plain" },
+          headers: { Origin: ORIGIN, "Content-Type": "text/plain" },
           body: "shop=valid-store.myshopify.com",
         });
         expect(await status(login, request)).toBe(415);
@@ -660,7 +663,10 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
       const loginForm = () =>
         new Request(`${ORIGIN}/auth/login`, {
           method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          headers: {
+            Origin: ORIGIN,
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
           body: "shop=not%20a%20shop",
         });
       const product = (shop: string, body: unknown = { id: 100 }) =>
@@ -792,7 +798,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         );
       });
 
-      it("treats an uninstall older than the store's last signed-in activity as stale even when it was never processed", async () => {
+      it("treats an uninstall older than the store's last signed visit as stale even when it was never processed", async () => {
         // The first delivery failed, the merchant reinstalled and opened the app,
         // and only then did Shopify's retry arrive. Nothing marked a reinstall.
         const f = await pairedStores();
@@ -821,7 +827,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         });
       });
 
-      it("still revokes when the signed-in activity is within a session token's life of the uninstall", async () => {
+      it("still revokes when the signed visit is within a signature's life of the uninstall", async () => {
         const f = await pairedStores();
         await offlineSession(f.a.shop, HOUR);
         await prisma.shopConnection.update({
@@ -955,11 +961,11 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
             await installation(f.a.shop, f.workspaceId, f.policyId),
           ).toEqual(LIVE);
         });
-        it("takes an uninstall right after a signed-in page, and ignores a retry older than it", async () => {
+        it("takes an uninstall right after a signed visit, and ignores a retry older than it", async () => {
           const f = await pairedStores();
           await offlineSession(f.a.shop, HOUR);
           skewProcessClock(direction * 4 * HOUR);
-          await ensureInstallation(f.a);
+          await recordSignedVisit(f.a.shop);
           expect(
             await status(
               uninstalled,

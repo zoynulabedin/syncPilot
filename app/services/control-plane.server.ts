@@ -96,11 +96,14 @@ async function audit(
 }
 /** Records a signed-in page load. It proves nothing about the stored tokens. */
 export async function ensureInstallation(actor: Actor) {
+  // A page load does not touch lastSeenAt: it runs on a session cookie, which says
+  // nothing about the app still being installed. See recordSignedVisit. The update
+  // changes nothing, but one that is empty loses Prisma's INSERT ... ON CONFLICT,
+  // and a page's parallel loaders would then collide on a store's first visit.
   const connection = await prisma.shopConnection.upsert({
     where: { shopDomain: actor.shop },
     create: { shopDomain: actor.shop },
-    // A later delivery's time is compared with this, whichever process wrote it.
-    update: { lastSeenAt: await databaseNow() },
+    update: { shopDomain: actor.shop },
   });
   if (connection.status === "CONNECTED" && !connection.uninstalledAt)
     return connection;

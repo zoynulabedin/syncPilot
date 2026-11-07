@@ -1,5 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { Form, Link, useActionData, useLoaderData } from "react-router";
+import { useActionData, useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
 import { requireActor } from "../services/authorization.server";
 import {
@@ -9,6 +9,7 @@ import {
 } from "../services/automatic-sync.server";
 import { databaseNow } from "../services/database-clock.server";
 import {
+  pageLoader,
   readActionForm,
   actionFailure,
   checked,
@@ -21,7 +22,9 @@ import { CONSENT_LIMITS, type ConsentLimit } from "../domain/automatic-limits";
 import {
   EmptyState,
   Field,
+  Form,
   InlineAction,
+  Link,
   Notice,
   Page,
   ReadOnly,
@@ -82,14 +85,14 @@ const limits: {
   },
 ];
 
-export async function loader({ request }: LoaderFunctionArgs) {
+export const loader = pageLoader(async ({ request }: LoaderFunctionArgs) => {
   return {
     ...(await getAutomaticConsents(
       requireActor(await authenticate.admin(request)),
     )),
     observedNow: (await databaseNow()).getTime(),
   };
-}
+});
 
 export async function action({ request }: ActionFunctionArgs) {
   const actor = requireActor(await authenticate.admin(request));
@@ -235,10 +238,12 @@ export default function AutomaticSync() {
               <strong>Stops when its setup changes</strong>
               <p>
                 Pausing or editing the policy, changing its mappings,
-                disconnecting a store, ending the pairing or the approving owner
-                losing access stops automatic writes. After a policy or mapping
-                change the consent is held, and a store owner must grant a new
-                one.
+                disconnecting a store or ending the pairing stops automatic
+                writes. After a policy or mapping change the consent is held,
+                and a store owner must grant a new one. Shopify tells SyncPilot
+                who owns a store only when they sign in, so a consent ends when
+                its approver signs in and is no longer the owner, or at its
+                expiry if they never do.
               </p>
             </div>
           </li>

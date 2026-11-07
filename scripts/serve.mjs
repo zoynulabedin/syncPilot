@@ -1,6 +1,6 @@
 // Production web entry. react-router-serve always logs each request's full URL,
-// and Shopify puts id_token and hmac on embedded document loads, so bearer tokens
-// would reach stdout and any log shipper. This serves the same build the same way
+// and Shopify puts hmac, state and one-time codes on sign-in URLs, so they would
+// reach stdout and any log shipper. This serves the same build the same way
 // and logs paths only. Usage: node scripts/serve.mjs ./build/server/index.js
 import { createServer } from "node:http";
 import path from "node:path";

@@ -1,11 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import {
-  Form,
-  Link,
-  useActionData,
-  useLoaderData,
-  useRevalidator,
-} from "react-router";
+import { useActionData, useLoaderData, useRevalidator } from "react-router";
 import { authenticate } from "../shopify.server";
 import { Pagination } from "../components/list-navigation";
 import { requireActor } from "../services/authorization.server";
@@ -15,6 +9,7 @@ import {
   requestReconciliation,
 } from "../services/control-plane.server";
 import {
+  pageLoader,
   readActionForm,
   actionFailure,
   textField,
@@ -22,6 +17,8 @@ import {
 import {
   EmptyState,
   Field,
+  Form,
+  Link,
   Notice,
   Page,
   ReadOnly,
@@ -32,7 +29,7 @@ import {
   Time,
 } from "../components/ui";
 
-export async function loader({ request }: LoaderFunctionArgs) {
+export const loader = pageLoader(async ({ request }: LoaderFunctionArgs) => {
   const actor = requireActor(await authenticate.admin(request));
   const [operations, { policies }] = await Promise.all([
     getOperations(actor, new URL(request.url).searchParams),
@@ -41,7 +38,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   // getOperations already resolved the workspace role; reuse it instead of
   // repeating the authorization lookups.
   return { ...operations, policies, canManage: operations.canOperate };
-}
+});
 export async function action({ request }: ActionFunctionArgs) {
   const actor = requireActor(await authenticate.admin(request));
   const form = await readActionForm(request);

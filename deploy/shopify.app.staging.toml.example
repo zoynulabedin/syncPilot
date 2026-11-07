@@ -2,7 +2,7 @@
 client_id = "REPLACE_WITH_STAGING_CLIENT_ID"
 name = "SyncPilot Staging"
 application_url = "https://REPLACE_WITH_STAGING_DOMAIN"
-embedded = true
+embedded = false
 
 [build]
 automatically_update_urls_on_dev = false

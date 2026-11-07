@@ -1,14 +1,17 @@
 import type { LoaderFunctionArgs } from "react-router";
-import { Form, Link, useLoaderData } from "react-router";
+import { useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
 import { requireActor } from "../services/authorization.server";
 import { databaseNow } from "../services/database-clock.server";
 import { getWorkspace } from "../services/control-plane.server";
+import { pageLoader } from "../components/actions.server";
 import {
   EmptyState,
   Field,
+  Form,
   Gid,
+  Link,
   Page,
   Section,
   Table,
@@ -16,7 +19,7 @@ import {
 } from "../components/ui";
 import { clampPage, parsePage } from "../components/pagination";
 
-export async function loader({ request }: LoaderFunctionArgs) {
+export const loader = pageLoader(async ({ request }: LoaderFunctionArgs) => {
   const actor = requireActor(await authenticate.admin(request));
   const { connections } = await getWorkspace(actor);
   const shops = [
@@ -112,7 +115,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     page,
     observedNow: (await databaseNow()).getTime(),
   };
-}
+});
 
 export default function Inventory() {
   const {

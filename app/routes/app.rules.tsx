@@ -1,5 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { Form, Link, useActionData, useLoaderData } from "react-router";
+import { useActionData, useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
 import { requireActor } from "../services/authorization.server";
 import { databaseNow } from "../services/database-clock.server";
@@ -11,6 +11,7 @@ import {
   updatePolicy,
 } from "../services/control-plane.server";
 import {
+  pageLoader,
   readActionForm,
   actionFailure,
   checked,
@@ -21,7 +22,9 @@ import { Changes, readChanges } from "../components/previews";
 import {
   EmptyState,
   Field,
+  Form,
   InlineAction,
+  Link,
   Notice,
   Page,
   ReadOnly,
@@ -49,13 +52,13 @@ const fieldLabels = {
   inventoryPolicy: "Allow selling out of stock (DENY / CONTINUE)",
 };
 
-export async function loader({ request }: LoaderFunctionArgs) {
+export const loader = pageLoader(async ({ request }: LoaderFunctionArgs) => {
   return {
     ...(await getPolicies(requireActor(await authenticate.admin(request)))),
     editingId: new URL(request.url).searchParams.get("edit"),
     observedNow: (await databaseNow()).getTime(),
   };
-}
+});
 
 export async function action({ request }: ActionFunctionArgs) {
   const actor = requireActor(await authenticate.admin(request));
