@@ -463,34 +463,48 @@ test("the whole sign-in works on the production build, every page renders withou
   test.setTimeout(60_000);
   const port = 3212;
   const base = `http://127.0.0.1:${port}`;
-  const server = spawn(
-    process.execPath,
-    [
-      "--import",
-      "./tests/e2e/shopify-stub.mjs",
-      "scripts/serve.mjs",
-      "./build/server/index.js",
-    ],
-    {
-      env: {
-        ...process.env,
-        NODE_ENV: "production",
-        PORT: String(port),
-        LOG_LEVEL: "debug",
-        SHOPIFY_API_KEY: "synthetic-contract-test-key",
-        SHOPIFY_API_SECRET: SECRET,
-        SHOPIFY_APP_URL: base,
-        SCOPES:
-          "read_products,write_products,read_inventory,write_inventory,read_locations",
-        SYNC_WRITE_ENABLED: "false",
-        INVENTORY_WRITE_ENABLED: "false",
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
   let output = "";
-  server.stdout.on("data", (data) => (output += data));
-  server.stderr.on("data", (data) => (output += data));
+  const startServer = () => {
+    const started = spawn(
+      process.execPath,
+      [
+        "--import",
+        "./tests/e2e/shopify-stub.mjs",
+        "scripts/serve.mjs",
+        "./build/server/index.js",
+      ],
+      {
+        env: {
+          ...process.env,
+          NODE_ENV: "production",
+          PORT: String(port),
+          LOG_LEVEL: "debug",
+          SHOPIFY_API_KEY: "synthetic-contract-test-key",
+          SHOPIFY_API_SECRET: SECRET,
+          SHOPIFY_APP_URL: base,
+          SCOPES:
+            "read_products,write_products,read_inventory,write_inventory,read_locations",
+          SYNC_WRITE_ENABLED: "false",
+          INVENTORY_WRITE_ENABLED: "false",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    started.stdout.on("data", (data) => (output += data));
+    started.stderr.on("data", (data) => (output += data));
+    return started;
+  };
+  let server = startServer();
+  const serverAnswers = () =>
+    expect
+      .poll(
+        () =>
+          fetch(`${base}/health`)
+            .then((response) => response.status)
+            .catch(() => 0),
+        { timeout: 20_000 },
+      )
+      .toBe(200);
   /** As a browser keeps them: an expiring cookie reaches only its own name and path. */
   const jar = {
     cookies: new Map<string, { name: string; value: string; path: string }>(),
@@ -591,15 +605,7 @@ test("the whole sign-in works on the production build, every page renders withou
     );
   const database = new PrismaClient();
   try {
-    await expect
-      .poll(
-        () =>
-          fetch(`${base}/health`)
-            .then((response) => response.status)
-            .catch(() => 0),
-        { timeout: 20_000 },
-      )
-      .toBe(200);
+    await serverAnswers();
     const shop = `http-flow-${randomUUID().slice(0, 8)}.myshopify.com`;
 
     // Opening it from Shopify, then both grants, then the dashboard.
@@ -938,6 +944,61 @@ test("the whole sign-in works on the production build, every page renders withou
     expect(await database.session.count({ where: { id: row } })).toBe(1);
     expect(jar.sessionId(down)).toBe(row);
     expect((await visit(`/app?shop=${down}`)).status).toBe(200);
+
+    // Logged out of Shopify, and only reading: the next time a page asks, that store's
+    // session ends, for a whole page and a menu click alike. A restart forgets what
+    // Shopify last said, as three minutes would. Nothing else stops working.
+    const readingPage = `revoked-${randomUUID().slice(0, 8)}.myshopify.com`;
+    const readingMenu = `revoked-${randomUUID().slice(0, 8)}.myshopify.com`;
+    await signInFromShopify(readingPage);
+    await signInFromShopify(readingMenu);
+    const readingRows = [
+      jar.sessionId(readingPage),
+      jar.sessionId(readingMenu),
+    ];
+    expect((await visit(`/app?shop=${readingPage}`)).status).toBe(200);
+    expect((await visit(`/app/rules.data?shop=${readingMenu}`)).status).toBe(
+      200,
+    );
+    const stopped = new Promise((resolve) => server.once("exit", resolve));
+    server.kill("SIGTERM");
+    await stopped;
+    server = startServer();
+    await serverAnswers();
+    const ended = await visit(`/app/rules?edit=abc&shop=${readingPage}`);
+    expect(ended.status).toBe(302);
+    const signInAgain = new URL(ended.headers.get("Location")!, base);
+    expect(signInAgain.pathname).toBe("/auth/login");
+    expect(signInAgain.searchParams.get("shop")).toBe(readingPage);
+    expect(signInAgain.searchParams.get("return_to")).toBe(
+      "/app/rules?edit=abc",
+    );
+    expect(ended.headers.get("X-Remix-Reload-Document")).toBe("true");
+    const endedMenu = await visit(
+      `/app/rules.data?edit=abc&shop=${readingMenu}&_routes=routes/app`,
+    );
+    // How React Router writes a redirect down: each field names where its value is.
+    const written = (await endedMenu.json()) as unknown[];
+    const fields = written[1] as Record<string, number>;
+    const field = (name: string) =>
+      written[fields[`_${written.indexOf(name)}`]];
+    expect(field("redirect")).toBe(
+      `/auth/login?${new URLSearchParams({
+        return_to: "/app/rules?edit=abc",
+        shop: readingMenu,
+      })}`,
+    );
+    expect(field("reload")).toBe(true);
+    for (const store of [readingPage, readingMenu])
+      expect(jar.has(`syncpilot_session.${store}`), store).toBe(false);
+    expect(
+      await database.session.count({ where: { id: { in: readingRows } } }),
+    ).toBe(0);
+    for (const store of [first, second, down]) {
+      const kept = await visit(`/app?shop=${store}`);
+      expect(kept.status, store).toBe(200);
+      expect(await kept.text(), store).toContain(store);
+    }
 
     // Staff with no access on a paired store get the reason and a way out, not a
     // bare 500. A production build hides an error's text, so this needs one.

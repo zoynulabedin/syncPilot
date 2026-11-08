@@ -1,5 +1,10 @@
 import "@shopify/shopify-api/adapters/web-api";
-import { ApiVersion, LogSeverity, shopifyApi } from "@shopify/shopify-api";
+import {
+  ApiVersion,
+  LogSeverity,
+  Session,
+  shopifyApi,
+} from "@shopify/shopify-api";
 import { createHmac } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import { createCookie } from "react-router";
@@ -17,6 +22,7 @@ import {
   assertSameOrigin,
   createAdminAuth,
   logSignInLibraryMessage,
+  PAGE_CHECK_RECORDS,
   safeReturnPath,
 } from "../app/services/admin-auth.server";
 import { storePath } from "../app/domain/store-binding";
@@ -312,6 +318,87 @@ describe("the key that signs a browser's cookies", () => {
     vi.stubEnv("NODE_ENV", "production");
     vi.stubEnv("SESSION_ENCRYPTION_KEY", "");
     expect(() => cookieSigningKey()).toThrow("SESSION_ENCRYPTION_KEY");
+  });
+});
+
+describe("asking Shopify about a session when a page opens", () => {
+  const SCOPES = ["read_products"];
+  const session = (id: string) =>
+    new Session({
+      id,
+      shop: STORE,
+      state: "",
+      isOnline: true,
+      accessToken: `token-for-${id}`,
+      scope: SCOPES.join(),
+      onlineAccessInfo: { associated_user: { id: 1 } } as never,
+    });
+  /** An instance whose only way to Shopify is a client that notes who was asked about. */
+  const counting = () => {
+    const asked: string[] = [];
+    const real = api("synthetic-secret", SCOPES);
+    const auth = createAdminAuth({
+      api: {
+        ...real,
+        clients: {
+          ...real.clients,
+          Graphql: class {
+            private id: string;
+            constructor({ session: { id } }: { session: Session }) {
+              this.id = id;
+            }
+            request = async () => {
+              asked.push(this.id);
+              return { data: { shop: { id: "gid://shopify/Shop/1" } } };
+            };
+          } as never,
+        },
+      },
+      sessionStorage: {
+        loadSession: async (id) => session(id),
+        storeSession: async () => true,
+      },
+      appUrl: ORIGIN,
+    });
+    return { auth, asked };
+  };
+  const page = (headers: HeadersInit = {}) =>
+    new Request(`${ORIGIN}/app?shop=${STORE}`, { headers });
+
+  it("is not part of authenticating, which makes no call", async () => {
+    vi.stubEnv(
+      "SESSION_ENCRYPTION_KEY",
+      Buffer.alloc(32, 7).toString("base64"),
+    );
+    const { auth, asked } = counting();
+    const request = page({ Cookie: await sessionCookie(cookieSigningKey()!) });
+    const { session: found } = await auth.authenticate(request);
+    expect(found.id).toBe("some-session");
+    expect(asked).toEqual([]);
+    await auth.proveLive(request, found);
+    expect(asked).toEqual(["some-session"]);
+  });
+
+  it("is kept for so many sessions: past that the oldest goes, and is only asked about again", async () => {
+    const { auth, asked } = counting();
+    for (let n = 0; n <= PAGE_CHECK_RECORDS; n += 1)
+      await auth.proveLive(page(), session(`session-${n}`));
+    expect(asked).toHaveLength(PAGE_CHECK_RECORDS + 1);
+    await auth.proveLive(page(), session(`session-${PAGE_CHECK_RECORDS}`));
+    await auth.proveLive(page(), session("session-1"));
+    expect(asked).toHaveLength(PAGE_CHECK_RECORDS + 1);
+    await auth.proveLive(page(), session("session-0"));
+    expect(asked).toHaveLength(PAGE_CHECK_RECORDS + 2);
+    expect(asked.at(-1)).toBe("session-0");
+  });
+
+  it("is each instance's own", async () => {
+    const first = counting();
+    const second = counting();
+    await first.auth.proveLive(page(), session("the-same"));
+    await second.auth.proveLive(page(), session("the-same"));
+    expect(first.asked).toEqual(["the-same"]);
+    expect(second.asked).toEqual(["the-same"]);
   });
 });
 

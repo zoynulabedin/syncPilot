@@ -29,6 +29,7 @@ import {
   shopifyRequest,
   TOKEN_DEADLINE_MS,
   withDeadline,
+  withOfflineTokenLock,
 } from "./shopify-client.server";
 import { cookieSigningKey } from "./token-crypto.server";
 
@@ -53,8 +54,9 @@ const MAX_REMEMBERED = 10;
  */
 const SIGN_IN_WINDOW_SECONDS = 10 * 60;
 /**
- * The smallest thing a token can be asked: `shop` needs no access scope, and every
- * state-changing request asks it. A person waits on this before their action runs.
+ * The smallest thing a token can be asked: `shop` needs no access scope. Every
+ * state-changing request asks it, and a person waits on that before their action runs.
+ * Pages ask it too, for far less: see checkPageLive.
  */
 const SESSION_CHECK_QUERY = `#graphql
   query SessionStillLive {
@@ -64,6 +66,11 @@ const SESSION_CHECK_QUERY = `#graphql
   }
 `;
 export const SESSION_CHECK_DEADLINE_MS = 8_000;
+/** One answer holds this long for every page a session opens, whatever it was. */
+const PAGE_CHECK_WINDOW_MS = 3 * 60_000;
+const PAGE_CHECK_DEADLINE_MS = 3_000;
+/** Each process keeps its own, and one it has dropped or never had is only asked again. */
+export const PAGE_CHECK_RECORDS = 1_000;
 /** Never kept in a return path: Shopify's signatures, and what an embedded load carried. */
 const SIGNED_PARAMS = [
   "_routes",
@@ -83,6 +90,7 @@ const SIGNED_PARAMS = [
 /** "repair" asks for the app's offline token, once Shopify has signed the way back. */
 type SignInStep = "online" | "repair";
 type SignInFlow = { shop: string; returnTo: string; step: SignInStep };
+type ShopifyAnswer = "live" | "refused" | "unavailable";
 type SessionStore = {
   loadSession(id: string): Promise<Session | undefined>;
   storeSession(session: Session): Promise<boolean>;
@@ -96,6 +104,8 @@ const SIGN_IN_PROBLEMS = {
     "Shopify's answer could not be verified, so you were not signed in. Sign in again.",
   EXCHANGE_FAILED:
     "Shopify did not complete the sign-in. Nothing was changed. Sign in again.",
+  TOKEN_BUSY:
+    "SyncPilot could not renew this store's access just now. Nothing was changed. Sign in again.",
   SUPERSEDED:
     "Another sign-in to this store started in this browser, so this one was not completed. Nothing was changed. Sign in again.",
   UNEXPECTED_TOKEN:
@@ -263,6 +273,11 @@ export function createAdminAuth({
   });
   const actionsChecked = new WeakMap<Request, Promise<AdminContext>>();
   const proofs = new WeakMap<Request, Promise<void>>();
+  /** By session, oldest first, which is the order a Map keeps. */
+  const pageChecks = new Map<
+    string,
+    { until: number; answer: Promise<ShopifyAnswer> }
+  >();
 
   /**
    * A row the key cannot open ends that sign-in. Any other failure is an outage, and
@@ -497,14 +512,86 @@ export function createAdminAuth({
     }
   }
 
+  /**
+   * Spends the code and keeps the token it bought, or says why not. The caller holds
+   * the token lock when this was to be an offline grant.
+   */
+  async function receiveGrant(
+    request: Request,
+    shop: string,
+    flow: SignInFlow,
+  ) {
+    const exchanged = await exchange(request, shop);
+    if (!("session" in exchanged)) return exchanged;
+    const { session } = exchanged;
+    // Shopify lets a person approve less than was asked for.
+    const everyScope = session.isScopeIncluded(api.config.scopes ?? "");
+    if (
+      session.shop !== shop ||
+      session.isOnline !== (flow.step === "online") ||
+      (session.isOnline && !isPerson(session))
+    ) {
+      // Per-user taken out of the URL, say. Shopify has now retired the token the
+      // worker holds in favour of this one, so this is the one that works. An
+      // answer with no refresh token is not an expiring offline token at all. Only a
+      // person's trip, which holds no lock, gets here with one, and a refresh still
+      // in flight must not store its answer over this afterwards. It is kept even if
+      // that wait comes to nothing, since the old token is already gone.
+      if (
+        session.shop === shop &&
+        !session.isOnline &&
+        session.refreshToken &&
+        everyScope
+      )
+        await withOfflineTokenLock(shop, () =>
+          sessionStorage.storeSession(session),
+        ).catch(() => sessionStorage.storeSession(session));
+      return refuse("UNEXPECTED_TOKEN", 400, shop);
+    }
+    if (!everyScope) return refuse("SCOPES_NOT_GRANTED", 403, shop);
+    await sessionStorage.storeSession(session);
+    return { session };
+  }
+
+  type Received = Awaited<ReturnType<typeof receiveGrant>>;
+  /**
+   * An offline grant retires what the worker holds as it happens, so it waits for a
+   * refresh and a refresh waits for it. Only a wait that never got the lock leaves the
+   * code unspent, and only that is answered with "sign in again". Once the lock is
+   * held, what the grant came to stands even if the transaction then ends badly, which
+   * undoes nothing that was stored, and a failure inside the grant is thrown.
+   */
+  async function receiveOfflineGrant(
+    request: Request,
+    shop: string,
+    flow: SignInFlow,
+  ) {
+    const attempt: { locked?: boolean; received?: Received } = {};
+    try {
+      return await withOfflineTokenLock(shop, async () => {
+        attempt.locked = true;
+        attempt.received = await receiveGrant(request, shop, flow);
+        return attempt.received;
+      });
+    } catch (error) {
+      if (attempt.received) return attempt.received;
+      if (attempt.locked) throw error;
+      return refuse("TOKEN_BUSY", 503, shop, {
+        failure: error instanceof Error ? error.constructor.name : typeof error,
+      });
+    }
+  }
+
   /** Bookkeeping for a person Shopify just named, and the end of this browser's last session here. */
   async function afterOnlineGrant(request: Request, session: Session) {
     const actor = requireActor({ session });
     await ensureInstallation(actor);
     await recordSignedVisit(session.shop);
-    // The only moment Shopify says what this person is now.
-    if (actor.role !== "OWNER")
-      await endFormerOwnerAuthority(actor.shop, actor.userId);
+    // The only moment Shopify says what this person is now, if it does say. A grant
+    // that leaves it out signs them in as staff, which is safe for what this session
+    // may do, and is no reason to undo anything: ending an owner cannot be reversed.
+    const said = session.onlineAccessInfo?.associated_user?.account_owner;
+    if (said === false) await endFormerOwnerAuthority(actor.shop, actor.userId);
     const previous = await sessionIdFor(request, session.shop);
     await prisma.session.deleteMany({
       where: {
@@ -515,10 +602,9 @@ export function createAdminAuth({
           ...(previous ? [{ id: previous }] : []),
           { expires: { lt: new Date() } },
           // Their sign-ins elsewhere stay, unless those now say something untrue.
-          {
-            userId: BigInt(actor.userId),
-            accountOwner: actor.role !== "OWNER",
-          },
+          ...(typeof said === "boolean"
+            ? [{ userId: BigInt(actor.userId), accountOwner: !said }]
+            : []),
         ],
       },
     });
@@ -569,12 +655,15 @@ export function createAdminAuth({
    * API a 403 means the store was marked fraudulent, a 402 frozen and a 423 locked,
    * none of which a new sign-in mends, and an ACCESS_DENIED is not a read that worked.
    */
-  async function askShopify(session: Session) {
+  async function askShopify(
+    session: Session,
+    deadlineMs: number,
+  ): Promise<ShopifyAnswer> {
     try {
       const client = new api.clients.Graphql({ session });
       const answer = await client.request<{ shop?: { id?: string } }>(
         SESSION_CHECK_QUERY,
-        { signal: AbortSignal.timeout(SESSION_CHECK_DEADLINE_MS) },
+        { signal: AbortSignal.timeout(deadlineMs) },
       );
       return answer.data?.shop?.id ? "live" : "unavailable";
     } catch (error) {
@@ -582,8 +671,20 @@ export function createAdminAuth({
     }
   }
 
+  /** What a refusal ends: this session and its cookie, and no other store's. */
+  async function endRefusedSession(session: Session) {
+    await prisma.session.deleteMany({
+      where: { id: session.id, isOnline: true },
+    });
+    return {
+      "Set-Cookie": await sessionCookie(session.shop).serialize("", {
+        maxAge: 0,
+      }),
+    };
+  }
+
   async function prove(session: Session) {
-    const answer = await askShopify(session);
+    const answer = await askShopify(session, SESSION_CHECK_DEADLINE_MS);
     if (answer === "live") return;
     logger.warn(
       { shop: session.shop, answer },
@@ -591,18 +692,51 @@ export function createAdminAuth({
     );
     if (answer === "unavailable")
       throw refused(503, { tryAgain: true }, { "Retry-After": "10" });
-    await prisma.session.deleteMany({
-      where: { id: session.id, isOnline: true },
-    });
     throw refused(
       401,
       { signIn: true, shop: session.shop },
-      {
-        "Set-Cookie": await sessionCookie(session.shop).serialize("", {
-          maxAge: 0,
-        }),
-      },
+      await endRefusedSession(session),
     );
+  }
+
+  function recordPageCheck(id: string, answer: Promise<ShopifyAnswer>) {
+    const check = { until: Date.now() + PAGE_CHECK_WINDOW_MS, answer };
+    pageChecks.delete(id);
+    pageChecks.set(id, check);
+    for (const oldest of pageChecks.keys()) {
+      if (pageChecks.size <= PAGE_CHECK_RECORDS) break;
+      pageChecks.delete(oldest);
+    }
+    return check;
+  }
+
+  /**
+   * Logging out of the admin ends a person's reading too, within minutes, but a page
+   * must never pay for that: it waits on Shopify briefly, once in the window, and every
+   * answer but a 401 lets it through and holds for the window, so a slow Shopify costs
+   * one navigation. A page load runs its loaders at once, and another tab may be
+   * loading too: all of them share this session's question while it is still out.
+   */
+  async function checkPageLive(request: Request, session: Session) {
+    const known = pageChecks.get(session.id);
+    const check =
+      known && known.until > Date.now()
+        ? known
+        : recordPageCheck(
+            session.id,
+            askShopify(session, PAGE_CHECK_DEADLINE_MS),
+          );
+    if ((await check.answer) !== "refused") return;
+    logger.warn(
+      { shop: session.shop, answer: "refused" },
+      "Page stopped: Shopify no longer accepts the sign-in",
+    );
+    throw redirectDocument(signInPath(session.shop, new URL(request.url)), {
+      headers: {
+        "Cache-Control": "no-store",
+        ...(await endRefusedSession(session)),
+      },
+    });
   }
 
   return {
@@ -624,11 +758,12 @@ export function createAdminAuth({
     /**
      * The row says who signed in, and only Shopify can say that still holds: logging
      * out of the admin revokes a person's online tokens, and nothing tells this app.
-     * So a state-changing request runs only once their own token has just worked.
-     * Pages do not ask. It asks at most once for a request, however often it is called.
+     * So a state-changing request runs only once their own token has just worked, and
+     * asks at most once for a request, however often it is called. A page asks far
+     * less, and only a refusal stops it: see checkPageLive.
      */
     proveLive(request: Request, session: Session): Promise<void> {
-      if (!changesState(request)) return Promise.resolve();
+      if (!changesState(request)) return checkPageLive(request, session);
       let proof = proofs.get(request);
       if (!proof) {
         proof = prove(session);
@@ -738,34 +873,21 @@ export function createAdminAuth({
         request.headers.get("Cookie"),
       )) as SignInFlow | null;
       if (flow?.shop !== shop) return overlapped(request, shop, "EXPIRED");
-      const exchanged = await exchange(request, shop);
-      if (!("session" in exchanged)) return exchanged;
-      const { session } = exchanged;
-      // Shopify lets a person approve less than was asked for.
-      const everyScope = session.isScopeIncluded(api.config.scopes ?? "");
-      if (
-        session.shop !== shop ||
-        session.isOnline !== (flow.step === "online") ||
-        (session.isOnline && !isPerson(session))
-      ) {
-        // Per-user taken out of the URL, say. Shopify has now retired the token the
-        // worker holds in favour of this one, so this is the one that works. An
-        // answer with no refresh token is not an expiring offline token at all.
-        if (
-          session.shop === shop &&
-          !session.isOnline &&
-          session.refreshToken &&
-          everyScope
-        )
-          await sessionStorage.storeSession(session);
-        return refuse("UNEXPECTED_TOKEN", 400, shop);
-      }
-      if (!everyScope) return refuse("SCOPES_NOT_GRANTED", 403, shop);
-      await sessionStorage.storeSession(session);
+      // A person's own token retires nothing that Shopify documents, so only the
+      // offline grant takes the token lock. Nothing below runs under it, since
+      // offlineAccessAlive wants it.
+      const received =
+        flow.step === "repair"
+          ? await receiveOfflineGrant(request, shop, flow)
+          : await receiveGrant(request, shop, flow);
+      if (!("session" in received)) return received;
+      const { session } = received;
 
       const returnTo = safeReturnPath(flow.returnTo);
       const cookies: string[] = [];
       if (flow.step === "online") {
+        // Shopify has only just said this token works, so the first page need not ask.
+        recordPageCheck(session.id, Promise.resolve("live"));
         await afterOnlineGrant(request, session);
         // This app's own cookies and none of the library's: an offline grant's session
         // must never reach a browser, and its one name could only hold one store.

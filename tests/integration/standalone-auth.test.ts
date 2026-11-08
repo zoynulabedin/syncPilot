@@ -1,4 +1,6 @@
 import { createHmac, randomUUID } from "node:crypto";
+import { availableParallelism } from "node:os";
+import type { Prisma } from "@prisma/client";
 import { Session } from "@shopify/shopify-api";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { createCookie } from "react-router";
@@ -34,8 +36,12 @@ const stub = vi.hoisted(() => {
     tokenEndpointHangs: false,
     tokenRequests: [] as Record<string, string>[],
     outbound: [] as { url: string; token: string | null }[],
-    refresh: (() => json({ error: "invalid_request" }, 401)) as () =>
-      Response | Promise<Response>,
+    refresh: (() => json({ error: "invalid_request" }, 401)) as (
+      body: Record<string, string>,
+      shop: string,
+    ) => Response | Promise<Response>,
+    /** What Shopify does with a code, before it answers for it. */
+    exchanging: (() => undefined) as () => void | Promise<void>,
     graphql: (() => json({ data: {} })) as (
       shop: string,
       token: string | null,
@@ -54,7 +60,8 @@ const stub = vi.hoisted(() => {
         return new Promise<Response>(() => undefined);
       const body = JSON.parse(String(init?.body)) as Record<string, string>;
       state.tokenRequests.push(body);
-      if (body.refresh_token) return state.refresh();
+      if (body.refresh_token) return state.refresh(body, target.hostname);
+      await state.exchanging();
       const grant = state.grants.get(body.code);
       return grant ? json(grant) : json({ error: "invalid_request" }, 400);
     }
@@ -103,14 +110,18 @@ import { cookieSigningKey } from "../../app/services/token-crypto.server";
 import { runWorkerOnce } from "../../app/services/sync-engine.server";
 import { storePath } from "../../app/domain/store-binding";
 import { INSTALLATION_CHECK_QUERY } from "../../app/domain/sync-operations";
+import { restoreProcessClock, skewProcessClock } from "./clock-skew";
 
 const SECRET = "synthetic-auth-secret";
 const ORIGIN = "https://app.example.invalid";
 const ALL_SCOPES = process.env.SCOPES!;
+const MINUTE = 60_000;
 const HOUR = 3_600_000;
 const BROWSER =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
 const FORM = { "Content-Type": "application/x-www-form-urlencoded" };
+/** A method that is not GET or HEAD reaches a route's action. */
+const STATE_CHANGING = ["POST", "PUT", "PATCH", "DELETE"];
 const SESSION_PREFIX = "syncpilot_session.";
 const sessionCookieName = (shop: string) => `${SESSION_PREFIX}${shop}`;
 const flowCookieName = (shop: string) => `syncpilot_sign_in.${shop}`;
@@ -130,14 +141,21 @@ type Outcome = {
   setCookies: string[];
   data?: unknown;
   retryAfter?: string | null;
+  /** A whole-page load, which is the only way a browser can leave for Shopify. */
+  reloadsDocument?: boolean;
 };
-type User = { id: number; account_owner: boolean } | null;
+/** A grant can say nothing about who owns the store, which is not saying "not them". */
+type User = { id: number; account_owner?: boolean } | null;
 let index: Route,
   login: Route,
   loginForm: Route,
   callback: Route,
   logout: Route;
-let layout: Route, stores: Route, uninstalled: Route, scopesUpdate: Route;
+let layout: Route,
+  stores: Route,
+  storesPage: Route,
+  uninstalled: Route,
+  scopesUpdate: Route;
 
 /** What the HTTP layer would send: a returned or a thrown Response, or data(). */
 async function run(route: Route, request: Request): Promise<Outcome> {
@@ -163,6 +181,7 @@ async function run(route: Route, request: Request): Promise<Outcome> {
         ? await result.clone().json()
         : await result.clone().text(),
       retryAfter: result.headers.get("Retry-After"),
+      reloadsDocument: result.headers.has("X-Remix-Reload-Document"),
     };
   const shaped = result as {
     type?: string;
@@ -531,6 +550,127 @@ function shortenTokenDeadline() {
     ...rest: unknown[]
   ) => real(run, ms === TOKEN_DEADLINE_MS ? 20 : ms, ...rest)) as never);
 }
+const pause = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+/** Waits for something another call is doing, rather than for a guess at how long. */
+async function until(condition: () => unknown) {
+  for (let tries = 0; tries < 1000; tries++) {
+    if (await condition()) return;
+    await pause(10);
+  }
+  throw new Error("What this test was waiting for never happened");
+}
+/** A call this test decides the moment of. */
+function held<T>() {
+  let release!: (value: T) => void;
+  const answer = new Promise<T>((resolve) => {
+    release = resolve;
+  });
+  return { answer, release };
+}
+const offlineRow = (shop: string) =>
+  prisma.session.findUniqueOrThrow({ where: { id: `offline_${shop}` } });
+/** Decrypted, as the worker will present it. */
+const workerRefreshToken = async (shop: string) =>
+  (await sessionStorage.loadSession(`offline_${shop}`))?.refreshToken;
+const refreshesPresented = () =>
+  stub.tokenRequests.filter((body) => body.refresh_token);
+const codesPresented = () => stub.tokenRequests.filter((body) => body.code);
+const due = (shop: string) =>
+  prisma.session.update({
+    where: { id: `offline_${shop}` },
+    data: { expires: new Date(Date.now() - MINUTE) },
+  });
+const catalogJob = async (shop: string) => {
+  const snapshot = await prisma.catalogSnapshot.create({
+    data: { shopDomain: shop, status: "QUEUED" },
+  });
+  return prisma.syncJob.create({
+    data: {
+      workspaceId: "",
+      policyId: "",
+      sourceShop: shop,
+      targetShop: shop,
+      operation: "CATALOG_IMPORT",
+      payload: { snapshotId: snapshot.id },
+      availableAt: new Date("1999-01-01"),
+    },
+  });
+};
+/** The worker takes the oldest job first, which these are, then this one is judged. */
+const runJob = async (id: string) => {
+  await runWorkerOnce("worker:standalone-auth");
+  return prisma.syncJob.findUniqueOrThrow({ where: { id } });
+};
+const putAside = (id: string) =>
+  prisma.syncJob.update({ where: { id }, data: { status: "CANCELLED" } });
+/** How many are queued behind a token operation in this database right now. */
+const tokenLockWaiters = async () =>
+  (
+    await prisma.$queryRaw<{ waiting: number }[]>`
+      SELECT count(*)::int AS "waiting" FROM pg_locks
+      WHERE locktype = 'advisory' AND NOT granted
+        AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`
+  )[0].waiting;
+/** Another process in the middle of a token operation for this store. */
+async function tokenLockHeldElsewhere(shop: string) {
+  const got = held<void>();
+  const finish = held<void>();
+  const done = prisma.$transaction(
+    async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`offline-token:${shop}`}))::text`;
+      got.release();
+      await finish.answer;
+    },
+    { timeout: 25_000 },
+  );
+  await got.answer;
+  return async () => {
+    finish.release();
+    await done;
+  };
+}
+type TransactionWork = (tx: Prisma.TransactionClient) => Promise<unknown>;
+/** Every transaction from here on still runs for real, as this test changes it. */
+function reachIntoTransactions(
+  change: (
+    work: TransactionWork,
+    options?: object,
+  ) => [TransactionWork, object?],
+) {
+  const real = prisma.$transaction.bind(prisma) as unknown as (
+    work: TransactionWork,
+    options?: object,
+  ) => Promise<unknown>;
+  return vi
+    .spyOn(prisma, "$transaction")
+    .mockImplementation(((work: TransactionWork, options?: object) =>
+      real(...change(work, options))) as never);
+}
+/**
+ * The lock's transaction with a shorter life or a shorter wait, so a test need not
+ * sit through them. Prisma and PostgreSQL still do the timing out.
+ */
+function shortenTokenLock(limits: { timeout?: number; lockWait?: number }) {
+  reachIntoTransactions((work, options) => [
+    (tx) =>
+      work(
+        new Proxy(tx, {
+          get: (target, name) =>
+            name === "$queryRaw"
+              ? (sql: TemplateStringsArray, ...values: unknown[]) =>
+                  target.$queryRaw(
+                    sql,
+                    ...(limits.lockWait && sql.join("").includes("lock_timeout")
+                      ? [String(limits.lockWait)]
+                      : values),
+                  )
+              : Reflect.get(target, name),
+        }),
+      ),
+    { ...options, ...(limits.timeout ? { timeout: limits.timeout } : {}) },
+  ]);
+}
 
 describe.skipIf(!process.env.TEST_DATABASE_URL)(
   "the dashboard's own sign-in, with the real library and PostgreSQL",
@@ -545,7 +685,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
       ({ action: logout } =
         (await import("../../app/routes/auth.logout")) as never);
       ({ loader: layout } = (await import("../../app/routes/app")) as never);
-      ({ action: stores } =
+      ({ action: stores, loader: storesPage } =
         (await import("../../app/routes/app.stores")) as never);
       ({ action: uninstalled } =
         (await import("../../app/routes/webhooks.app.uninstalled")) as never);
@@ -559,6 +699,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
       stub.tokenEndpointDown = false;
       stub.tokenEndpointHangs = false;
       stub.refresh = () => stub.json({ error: "invalid_request" }, 401);
+      stub.exchanging = () => undefined;
       stub.graphql = (shop) =>
         stub.json({
           data: {
@@ -2371,9 +2512,10 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         browser: Browser,
         path: string,
         body = "intent=anything",
+        method = "POST",
       ) =>
         browser.raw(path, {
-          method: "POST",
+          method,
           headers: { ...FORM, Origin: ORIGIN },
           body,
         });
@@ -2416,45 +2558,54 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
           }
       });
 
-      it.each([
-        ["names no store", ""],
-        ["names something that is not a store", "?shop=not-a-store"],
-        ["names no store it can believe", "?shop=A&shop=B"],
-      ])(
-        "every action refuses an address that %s, and nothing is applied",
-        async (_, query) => {
-          const { a, b, browser } = await twoStores();
+      describe.each(STATE_CHANGING)("with a %s", (method) => {
+        it.each([
+          ["names no store", ""],
+          ["names something that is not a store", "?shop=not-a-store"],
+          ["names no store it can believe", "?shop=A&shop=B"],
+        ])(
+          "every action refuses an address that %s, and nothing is applied",
+          async (_, query) => {
+            const { a, b, browser } = await twoStores();
+            const before = await databaseState();
+            stub.outbound.length = 0;
+            for (const [file, action] of await everyAction()) {
+              const request = postTo(
+                browser,
+                `/app/anything${query.replace("A", a).replace("B", b)}`,
+                undefined,
+                method,
+              );
+              const outcome = await run(action, request);
+              expect(outcome.status, file).toBe(400);
+              expect(outcome.data, file).toEqual({ storeMissing: true });
+              expect(request.bodyUsed, file).toBe(false);
+            }
+            expect(stub.outbound).toEqual([]);
+            expect(await databaseState()).toEqual(before);
+          },
+        );
+
+        it("every action refuses a store this browser has no session for, and nothing is applied", async () => {
+          const { browser } = await twoStores();
+          const third = (await signIn(shopName("tab-c"))).shop;
           const before = await databaseState();
           stub.outbound.length = 0;
           for (const [file, action] of await everyAction()) {
             const request = postTo(
               browser,
-              `/app/anything${query.replace("A", a).replace("B", b)}`,
+              dashboard(third, "/app/anything"),
+              undefined,
+              method,
             );
             const outcome = await run(action, request);
-            expect(outcome.status, file).toBe(400);
-            expect(outcome.data, file).toEqual({ storeMissing: true });
+            expect(outcome.status, file).toBe(401);
+            expect(outcome.data, file).toEqual({ signIn: true, shop: third });
             expect(request.bodyUsed, file).toBe(false);
           }
           expect(stub.outbound).toEqual([]);
           expect(await databaseState()).toEqual(before);
-        },
-      );
-
-      it("every action refuses a store this browser has no session for, and nothing is applied", async () => {
-        const { browser } = await twoStores();
-        const third = (await signIn(shopName("tab-c"))).shop;
-        const before = await databaseState();
-        stub.outbound.length = 0;
-        for (const [file, action] of await everyAction()) {
-          const request = postTo(browser, dashboard(third, "/app/anything"));
-          const outcome = await run(action, request);
-          expect(outcome.status, file).toBe(401);
-          expect(outcome.data, file).toEqual({ signIn: true, shop: third });
-          expect(request.bodyUsed, file).toBe(false);
-        }
-        expect(stub.outbound).toEqual([]);
-        expect(await databaseState()).toEqual(before);
+        });
       });
 
       it("a store's lapsed session stops only that store's actions", async () => {
@@ -2644,106 +2795,111 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
       });
     });
 
+    const personGets = (
+      answer: (init?: RequestInit) => Response | Promise<Response>,
+    ) => {
+      const normal = stub.graphql;
+      stub.graphql = (shop, token, init) =>
+        token?.startsWith("shpua_") ? answer(init) : normal(shop, token, init);
+    };
+    const refused = () =>
+      stub.json({ errors: "[API] Invalid API key or access token" }, 401);
+    const stillLive = () =>
+      stub.json({ data: { shop: { id: "gid://shopify/Shop/1" } } });
+    /** Every answer but a 401: none of them says the person's token works, or that it does not. */
+    const provesNothing: [string, () => Response][] = [
+      ["a 500", () => stub.json({ errors: "broken" }, 500)],
+      ["a 429", () => stub.json({ errors: "slow down" }, 429)],
+      ["a 402, which means a frozen store", () => stub.json({}, 402)],
+      ["a 403, which means a fraud flag", () => stub.json({}, 403)],
+      ["a 404", () => stub.json({}, 404)],
+      ["a 423, which means a locked store", () => stub.json({}, 423)],
+      [
+        "ACCESS_DENIED, which is not a read that worked",
+        () =>
+          stub.json({
+            data: null,
+            errors: [
+              {
+                message: "Access denied",
+                extensions: { code: "ACCESS_DENIED" },
+              },
+            ],
+          }),
+      ],
+      [
+        "a throttle in a 200",
+        () =>
+          stub.json({
+            errors: [
+              { message: "Throttled", extensions: { code: "THROTTLED" } },
+            ],
+          }),
+      ],
+      ["an answer with no shop in it", () => stub.json({ data: {} })],
+      [
+        "an answer that is not JSON",
+        () => new Response("<html></html>", { status: 200 }),
+      ],
+      [
+        "a failure to connect",
+        () => {
+          throw new TypeError("fetch failed");
+        },
+      ],
+    ];
+
     describe("proving a person's sign-in to Shopify before an action", () => {
-      const personGets = (
-        answer: (init?: RequestInit) => Response | Promise<Response>,
-      ) => {
-        const normal = stub.graphql;
-        stub.graphql = (shop, token, init) =>
-          token?.startsWith("shpua_")
-            ? answer(init)
-            : normal(shop, token, init);
-      };
-      const refused = () =>
-        stub.json({ errors: "[API] Invalid API key or access token" }, 401);
-      const post = (browser: Browser, shop: string) =>
+      const post = (browser: Browser, shop: string, method = "POST") =>
         browser.raw(dashboard(shop, "/app/anything"), {
-          method: "POST",
+          method,
           headers: { ...FORM, Origin: ORIGIN },
           body: "intent=anything",
         });
 
-      it("every action, for a token Shopify refuses: the session ends and nothing is applied", async () => {
-        personGets(refused);
-        for (const [file, action] of await everyAction()) {
+      describe.each(STATE_CHANGING)("with a %s", (method) => {
+        it("every action, for a token Shopify refuses: the session ends and nothing is applied", async () => {
+          personGets(refused);
+          for (const [file, action] of await everyAction()) {
+            const { shop, browser } = await signIn();
+            const id = sessionId(browser);
+            const before = await databaseState("Session");
+            const request = post(browser, shop, method);
+            const outcome = await run(action, request);
+            browser.absorb(outcome.setCookies);
+            expect(outcome.status, file).toBe(401);
+            expect(outcome.data, file).toEqual({ signIn: true, shop });
+            expect(request.bodyUsed, file).toBe(false);
+            expect(await prisma.session.count({ where: { id } })).toBe(0);
+            expect(browser.jar.hasSession(), file).toBe(false);
+            expect(await databaseState("Session"), file).toEqual(before);
+            // The worker's access is a different matter.
+            expect(
+              await prisma.session.count({ where: { id: `offline_${shop}` } }),
+            ).toBe(1);
+          }
+        });
+
+        it("every action, when Shopify cannot answer: still signed in, nothing is applied", async () => {
+          personGets(() => stub.json({ errors: "unavailable" }, 503));
           const { shop, browser } = await signIn();
           const id = sessionId(browser);
-          const before = await databaseState("Session");
-          const request = post(browser, shop);
-          const outcome = await run(action, request);
-          browser.absorb(outcome.setCookies);
-          expect(outcome.status, file).toBe(401);
-          expect(outcome.data, file).toEqual({ signIn: true, shop });
-          expect(request.bodyUsed, file).toBe(false);
-          expect(await prisma.session.count({ where: { id } })).toBe(0);
-          expect(browser.jar.hasSession(), file).toBe(false);
-          expect(await databaseState("Session"), file).toEqual(before);
-          // The worker's access is a different matter.
-          expect(
-            await prisma.session.count({ where: { id: `offline_${shop}` } }),
-          ).toBe(1);
-        }
+          const before = await databaseState();
+          for (const [file, action] of await everyAction()) {
+            const request = post(browser, shop, method);
+            const outcome = await run(action, request);
+            expect(outcome.status, file).toBe(503);
+            expect(outcome.data, file).toEqual({ tryAgain: true });
+            expect(outcome.retryAfter, file).toBe("10");
+            expect(outcome.setCookies, file).toEqual([]);
+            expect(request.bodyUsed, file).toBe(false);
+          }
+          expect(await prisma.session.count({ where: { id } })).toBe(1);
+          expect(await databaseState()).toEqual(before);
+        });
       });
 
-      it("every action, when Shopify cannot answer: still signed in, nothing is applied", async () => {
-        personGets(() => stub.json({ errors: "unavailable" }, 503));
-        const { shop, browser } = await signIn();
-        const id = sessionId(browser);
-        const before = await databaseState();
-        for (const [file, action] of await everyAction()) {
-          const request = post(browser, shop);
-          const outcome = await run(action, request);
-          expect(outcome.status, file).toBe(503);
-          expect(outcome.data, file).toEqual({ tryAgain: true });
-          expect(outcome.retryAfter, file).toBe("10");
-          expect(outcome.setCookies, file).toEqual([]);
-          expect(request.bodyUsed, file).toBe(false);
-        }
-        expect(await prisma.session.count({ where: { id } })).toBe(1);
-        expect(await databaseState()).toEqual(before);
-      });
-
-      it.each<[string, () => Response]>([
-        ["a 500", () => stub.json({ errors: "broken" }, 500)],
-        ["a 429", () => stub.json({ errors: "slow down" }, 429)],
-        ["a 402, which means a frozen store", () => stub.json({}, 402)],
-        ["a 403, which means a fraud flag", () => stub.json({}, 403)],
-        ["a 404", () => stub.json({}, 404)],
-        ["a 423, which means a locked store", () => stub.json({}, 423)],
-        [
-          "ACCESS_DENIED, which is not a read that worked",
-          () =>
-            stub.json({
-              data: null,
-              errors: [
-                {
-                  message: "Access denied",
-                  extensions: { code: "ACCESS_DENIED" },
-                },
-              ],
-            }),
-        ],
-        [
-          "a throttle in a 200",
-          () =>
-            stub.json({
-              errors: [
-                { message: "Throttled", extensions: { code: "THROTTLED" } },
-              ],
-            }),
-        ],
-        ["an answer with no shop in it", () => stub.json({ data: {} })],
-        [
-          "an answer that is not JSON",
-          () => new Response("<html></html>", { status: 200 }),
-        ],
-        [
-          "a failure to connect",
-          () => {
-            throw new TypeError("fetch failed");
-          },
-        ],
-      ])(
+      it.each(provesNothing)(
         "%s proves nothing: nothing is applied and the session stays",
         async (_, answer) => {
           const { shop, browser } = await signIn();
@@ -2816,7 +2972,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
           new Headers(init?.headers).get("X-Shopify-Access-Token") ===
           first.grants[0].access_token
             ? refused()
-            : stub.json({ data: { shop: { id: "gid://shopify/Shop/1" } } }),
+            : stillLive(),
         );
         const idB = sessionId(browser, b);
         const outcome = await run(stores, post(browser, a));
@@ -2843,15 +2999,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         expect((await request.formData()).get("intent")).toBe("anything");
       });
 
-      it("a page does not ask, so a read costs Shopify nothing", async () => {
-        personGets(refused);
-        const { browser } = await signIn();
-        stub.outbound.length = 0;
-        expect((await run(layout, browser.request("/app"))).status).toBe(200);
-        expect(stub.outbound).toEqual([]);
-      });
-
-      it("an action over its limit does not ask either", async () => {
+      it("an action over its limit does not ask", async () => {
         const { shop, browser } = await signIn();
         await prisma.requestRateLimit.create({
           data: {
@@ -2876,6 +3024,300 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         personGets(refused);
         const { shop, browser, grants } = await signIn();
         await run(stores, post(browser, shop));
+        expect(warn).toHaveBeenCalledWith(
+          { shop, answer: "refused" },
+          expect.any(String),
+        );
+        expect(JSON.stringify(warn.mock.calls)).not.toContain(
+          grants[0].access_token,
+        );
+      });
+    });
+
+    describe("asking Shopify about a person's sign-in when a page opens", () => {
+      afterEach(restoreProcessClock);
+      /** A page opened when the last answer no longer holds, as any will be in time. */
+      const threeMinutesOn = () => skewProcessClock(3 * MINUTE);
+      const tokenSent = (init?: RequestInit) =>
+        new Headers(init?.headers).get("X-Shopify-Access-Token");
+      const personAsked = () =>
+        stub.outbound.filter(({ token }) => token?.startsWith("shpua_"));
+      /** Shopify takes the question and answers when this test says. */
+      const personKeptWaiting = () => {
+        const answer = held<Response>();
+        personGets(() => answer.answer);
+        return answer;
+      };
+
+      it.each(["GET", "HEAD"])(
+        "on a %s, a token Shopify refuses ends that store's session and goes to sign in, keeping the page",
+        async (method) => {
+          const browser = new Browser();
+          const a = await signIn(shopName("page-a"), OWNER, browser);
+          const b = await signIn(shopName("page-b"), OWNER, browser);
+          const [idA, idB] = [
+            sessionId(browser, a.shop),
+            sessionId(browser, b.shop),
+          ];
+          personGets((init) =>
+            tokenSent(init) === a.grants[0].access_token
+              ? refused()
+              : stillLive(),
+          );
+          threeMinutesOn();
+          stub.outbound.length = 0;
+          const outcome = await run(
+            layout,
+            browser.raw(dashboard(a.shop, "/app/rules?edit=abc"), { method }),
+          );
+          browser.absorb(outcome.setCookies);
+          expect(outcome.status).toBe(302);
+          expect(outcome.reloadsDocument).toBe(true);
+          const target = new URL(outcome.location!, ORIGIN);
+          expect(target.pathname).toBe("/auth/login");
+          expect(target.searchParams.get("shop")).toBe(a.shop);
+          expect(target.searchParams.get("return_to")).toBe(
+            "/app/rules?edit=abc",
+          );
+          expect(personAsked()).toHaveLength(1);
+          expect(await prisma.session.count({ where: { id: idA } })).toBe(0);
+          expect(browser.jar.has(sessionCookieName(a.shop))).toBe(false);
+          // The other store has not been touched, and neither has the worker's access.
+          expect(await prisma.session.count({ where: { id: idB } })).toBe(1);
+          expect(sessionId(browser, b.shop)).toBe(idB);
+          expect(
+            await run(layout, browser.raw(dashboard(b.shop))),
+          ).toMatchObject({ status: 200, data: { shop: b.shop } });
+          expect(
+            await prisma.session.count({ where: { id: `offline_${a.shop}` } }),
+          ).toBe(1);
+        },
+      );
+
+      it("ends one person's sign-in to a store, and no one else's there", async () => {
+        const { shop, browser, grants } = await signIn();
+        const staff = await signIn(shop, STAFF);
+        personGets((init) =>
+          tokenSent(init) === grants[0].access_token ? refused() : stillLive(),
+        );
+        threeMinutesOn();
+        expect((await run(layout, browser.request("/app"))).status).toBe(302);
+        expect((await run(layout, staff.browser.request("/app"))).status).toBe(
+          200,
+        );
+      });
+
+      it("asks at most once in three minutes for a session, and again after that", async () => {
+        const { browser } = await signIn();
+        personGets(stillLive);
+        const page = async () =>
+          expect((await run(layout, browser.request("/app"))).status).toBe(200);
+        threeMinutesOn();
+        stub.outbound.length = 0;
+        await page();
+        await page();
+        expect(personAsked()).toHaveLength(1);
+        skewProcessClock(3 * MINUTE - 1000);
+        await page();
+        expect(personAsked()).toHaveLength(1);
+        skewProcessClock(1000);
+        await page();
+        await page();
+        expect(personAsked()).toHaveLength(2);
+      });
+
+      it("asks for each session on its own", async () => {
+        const first = await signIn();
+        const second = await signIn(first.shop, STAFF);
+        personGets(stillLive);
+        threeMinutesOn();
+        stub.outbound.length = 0;
+        for (const { browser } of [first, second, first, second])
+          expect((await run(layout, browser.request("/app"))).status).toBe(200);
+        expect(personAsked().map(({ token }) => token)).toEqual([
+          first.grants[0].access_token,
+          second.grants[0].access_token,
+        ]);
+      });
+
+      it.each(provesNothing)(
+        "%s lets the page through as if nothing had been asked, and holds for three minutes",
+        async (_, answer) => {
+          const { browser } = await signIn();
+          const id = sessionId(browser);
+          personGets(answer);
+          threeMinutesOn();
+          stub.outbound.length = 0;
+          for (let page = 0; page < 3; page += 1)
+            expect(await run(layout, browser.request("/app"))).toMatchObject({
+              status: 200,
+              setCookies: [],
+            });
+          expect(personAsked()).toHaveLength(1);
+          expect(await prisma.session.count({ where: { id } })).toBe(1);
+          // It is only that long: a token refused later is still noticed.
+          personGets(refused);
+          skewProcessClock(3 * MINUTE);
+          expect((await run(layout, browser.request("/app"))).status).toBe(302);
+        },
+      );
+
+      it("waits three seconds at most, once, so a slow Shopify does not slow every navigation", async () => {
+        const { browser } = await signIn();
+        const real = AbortSignal.timeout.bind(AbortSignal);
+        const deadlines = vi
+          .spyOn(AbortSignal, "timeout")
+          .mockImplementation((ms) => real(ms === 3_000 ? 20 : ms));
+        personGets(
+          (init) =>
+            new Promise((_, reject) => {
+              init?.signal?.addEventListener("abort", () =>
+                reject(init.signal!.reason),
+              );
+            }),
+        );
+        threeMinutesOn();
+        stub.outbound.length = 0;
+        for (let page = 0; page < 3; page += 1)
+          expect((await run(layout, browser.request("/app"))).status).toBe(200);
+        expect(personAsked()).toHaveLength(1);
+        expect(deadlines).toHaveBeenCalledWith(3_000);
+      });
+
+      it("one page load's loaders share one question, as does any other request for that session meanwhile", async () => {
+        const { browser } = await signIn();
+        const answer = personKeptWaiting();
+        threeMinutesOn();
+        stub.outbound.length = 0;
+        const page = Promise.all([
+          run(layout, browser.request("/app/stores")),
+          run(storesPage, browser.request("/app/stores")),
+        ]);
+        await until(() => personAsked().length);
+        await pause(200);
+        expect(personAsked()).toHaveLength(1);
+        answer.release(stillLive());
+        for (const outcome of await page) expect(outcome.status).toBe(200);
+        expect(personAsked()).toHaveLength(1);
+      });
+
+      it("when that one answer is a refusal, each loader goes to sign in on it", async () => {
+        const { shop, browser } = await signIn();
+        const id = sessionId(browser);
+        const answer = personKeptWaiting();
+        threeMinutesOn();
+        stub.outbound.length = 0;
+        const page = Promise.all([
+          run(layout, browser.request("/app/stores")),
+          run(storesPage, browser.request("/app/stores")),
+        ]);
+        await until(() => personAsked().length);
+        await pause(200);
+        answer.release(refused());
+        for (const outcome of await page) {
+          expect(outcome.status).toBe(302);
+          expect(
+            new URL(outcome.location!, ORIGIN).searchParams.get("shop"),
+          ).toBe(shop);
+          expect(outcome.setCookies.join()).toContain(sessionCookieName(shop));
+        }
+        expect(personAsked()).toHaveLength(1);
+        expect(await prisma.session.count({ where: { id } })).toBe(0);
+      });
+
+      it("the first page after a sign-in does not ask: Shopify has only just answered", async () => {
+        personGets(refused);
+        const { browser } = await signIn();
+        stub.outbound.length = 0;
+        expect((await run(layout, browser.request("/app"))).status).toBe(200);
+        skewProcessClock(2 * MINUTE);
+        expect((await run(layout, browser.request("/app"))).status).toBe(200);
+        expect(stub.outbound).toEqual([]);
+        skewProcessClock(MINUTE);
+        expect((await run(layout, browser.request("/app"))).status).toBe(302);
+      });
+
+      it("a person sent to sign in comes back to the same page, and is not sent round again", async () => {
+        personGets(refused);
+        const { shop, browser } = await signIn();
+        threeMinutesOn();
+        const asked = await browser.visit(layout, "/app/rules?edit=abc");
+        const { final, trips } = await atShopify(
+          browser,
+          await browser.visit(login, asked.location!),
+        );
+        expect(trips).toEqual(["online"]);
+        expect(final.location).toBe(dashboard(shop, "/app/rules?edit=abc"));
+        stub.outbound.length = 0;
+        expect(
+          (await run(layout, browser.request("/app/rules?edit=abc"))).status,
+        ).toBe(200);
+        expect(stub.outbound).toEqual([]);
+      });
+
+      it("every page answers to it, not only the layout", async () => {
+        const modules = import.meta.glob<{ loader?: Route }>(
+          "../../app/routes/app.*.tsx",
+        );
+        expect(Object.keys(modules).length).toBeGreaterThanOrEqual(13);
+        personGets(refused);
+        for (const [file, load] of Object.entries(modules)) {
+          const { loader } = await load();
+          const { browser } = await signIn();
+          threeMinutesOn();
+          const outcome = await run(loader!, browser.request("/app/page"));
+          restoreProcessClock();
+          expect(outcome.status, file).toBe(302);
+          expect(outcome.reloadsDocument, file).toBe(true);
+        }
+      });
+
+      it("a page over its limit does not ask", async () => {
+        const { shop, browser } = await signIn();
+        await prisma.requestRateLimit.create({
+          data: {
+            key: rateLimitKey(
+              "user:read",
+              JSON.stringify([shop, String(OWNER!.id)]),
+            ),
+            count: RATE_LIMITS.userRead,
+            expiresAt: new Date(Date.now() + MINUTE),
+          },
+        });
+        threeMinutesOn();
+        stub.outbound.length = 0;
+        expect((await run(layout, browser.request("/app"))).status).toBe(429);
+        expect(stub.outbound).toEqual([]);
+      });
+
+      it("an action still asks every time, whatever the pages were told", async () => {
+        const { shop, browser } = await signIn();
+        personGets(stillLive);
+        threeMinutesOn();
+        stub.outbound.length = 0;
+        const post = () =>
+          browser.post(stores, "/app/stores", "intent=nothing");
+        expect((await run(layout, browser.request("/app"))).status).toBe(200);
+        expect((await post()).status).toBe(200);
+        expect((await post()).status).toBe(200);
+        expect(personAsked()).toHaveLength(3);
+        // A page has just been told this token works, and an action is still refused.
+        personGets(refused);
+        expect((await post()).status).toBe(401);
+        expect((await run(layout, browser.request("/app"))).status).toBe(302);
+        expect(
+          await prisma.session.count({ where: { shop, isOnline: true } }),
+        ).toBe(0);
+      });
+
+      it("nothing about the check reaches a log but the store and what happened", async () => {
+        const warn = vi.spyOn(logger, "warn").mockImplementation((() => {
+          return undefined;
+        }) as never);
+        personGets(refused);
+        const { shop, browser, grants } = await signIn();
+        threeMinutesOn();
+        await run(layout, browser.request("/app"));
         expect(warn).toHaveBeenCalledWith(
           { shop, answer: "refused" },
           expect.any(String),
@@ -3388,6 +3830,111 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
           expect((await run(layout, browser.request("/app"))).status).toBe(200);
       });
 
+      describe("a grant that does not say", () => {
+        const SILENT: User = { id: 101 };
+        const queued = async (a: string, b: string, consentId: string) =>
+          prisma.syncJob.create({
+            data: {
+              workspaceId: (await connection(a))!.workspaceId!,
+              policyId: (
+                await prisma.automaticConsent.findUniqueOrThrow({
+                  where: { id: consentId },
+                })
+              ).policyId,
+              sourceShop: a,
+              targetShop: b,
+              operation: "AUTO_PREVIEW",
+              payload: { consentId },
+              availableAt: new Date("2000-01-01"),
+            },
+          });
+
+        it("leaves the owner row, the consents and the queued jobs alone, and then a grant saying false ends them", async () => {
+          const { a, b, workspaceId, policyId } = await paired();
+          const theirs = await consent(workspaceId, policyId, `${a}:101`);
+          const job = await queued(a, b, theirs.id);
+          const consentStatus = async () =>
+            (
+              await prisma.automaticConsent.findUniqueOrThrow({
+                where: { id: theirs.id },
+              })
+            ).status;
+          const jobStatus = async () =>
+            (await prisma.syncJob.findUniqueOrThrow({ where: { id: job.id } }))
+              .status;
+
+          await signIn(a, SILENT);
+          expect(await member(workspaceId, a, "101")).toMatchObject({
+            role: "OWNER",
+            status: "ACTIVE",
+          });
+          expect(await consentStatus()).toBe("ACTIVE");
+          expect(await jobStatus()).toBe("PENDING");
+          expect(
+            await prisma.auditEvent.count({
+              where: { shopDomain: a, action: "OWNER_ROLE_ENDED" },
+            }),
+          ).toBe(0);
+
+          await signIn(a, FORMER);
+          expect(await member(workspaceId, a, "101")).toMatchObject({
+            role: "VIEWER",
+            status: "REVOKED",
+          });
+          expect(await consentStatus()).toBe("REVOKED");
+          expect(await jobStatus()).toBe("CANCELLED");
+          await prisma.syncJob.delete({ where: { id: job.id } });
+        });
+
+        it("leaves that person's other sign-ins alone, whichever they say", async () => {
+          const { a } = await paired();
+          const owner = await signIn(a, OWNER);
+          const staffElsewhere = await signIn(a, {
+            id: 303,
+            account_owner: false,
+          });
+          await signIn(a, SILENT);
+          await signIn(a, { id: 303 });
+          expect(
+            (await run(layout, owner.browser.request("/app"))).status,
+          ).toBe(200);
+          expect(
+            (await run(layout, staffElsewhere.browser.request("/app"))).status,
+          ).toBe(200);
+        });
+
+        it("still gives this sign-in no owner's rights, and is not asked to undo them", async () => {
+          const { a, workspaceId } = await paired();
+          const { browser } = await signIn(a, SILENT);
+          const { authenticate } = await import("../../app/shopify.server");
+          expect(
+            requireActor(await authenticate.admin(browser.request("/app"))),
+          ).toMatchObject({ userId: "101", role: "VIEWER" });
+          expect(await member(workspaceId, a, "101")).toMatchObject({
+            role: "OWNER",
+          });
+        });
+
+        it("reads a null the same way", async () => {
+          const { a, workspaceId } = await paired();
+          await signIn(a, { id: 101, account_owner: null as never });
+          expect(await member(workspaceId, a, "101")).toMatchObject({
+            role: "OWNER",
+            status: "ACTIVE",
+          });
+        });
+      });
+
+      it("a later grant saying owner does not bring back what was ended", async () => {
+        const { a, workspaceId } = await paired();
+        await signIn(a, FORMER);
+        await signIn(a, OWNER);
+        expect(await member(workspaceId, a, "101")).toMatchObject({
+          role: "VIEWER",
+          status: "REVOKED",
+        });
+      });
+
       it("the owner signing in changes nothing, and neither does staff with no owner row", async () => {
         const { a, workspaceId, policyId } = await paired();
         const theirs = await consent(workspaceId, policyId, `${a}:101`);
@@ -3481,32 +4028,6 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
     });
 
     describe("a refresh of the worker's token that fails", () => {
-      const due = (shop: string) =>
-        prisma.session.update({
-          where: { id: `offline_${shop}` },
-          data: { expires: new Date(Date.now() - 60_000) },
-        });
-      const catalogJob = async (shop: string) => {
-        const snapshot = await prisma.catalogSnapshot.create({
-          data: { shopDomain: shop, status: "QUEUED" },
-        });
-        return prisma.syncJob.create({
-          data: {
-            workspaceId: "",
-            policyId: "",
-            sourceShop: shop,
-            targetShop: shop,
-            operation: "CATALOG_IMPORT",
-            payload: { snapshotId: snapshot.id },
-            availableAt: new Date("1999-01-01"),
-          },
-        });
-      };
-      /** The worker takes the oldest job first, which these are, then this one is judged. */
-      const runJob = async (id: string) => {
-        await runWorkerOnce("worker:standalone-auth");
-        return prisma.syncJob.findUniqueOrThrow({ where: { id } });
-      };
       const transient: [string, () => Response | Promise<Response>][] = [
         ["a 503", () => stub.json({ errors: "unavailable" }, 503)],
         ["a 500", () => stub.json({ errors: "broken" }, 500)],
@@ -3528,9 +4049,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         async (_, answer) => {
           const { shop } = await signIn();
           await due(shop);
-          const before = await prisma.session.findUniqueOrThrow({
-            where: { id: `offline_${shop}` },
-          });
+          const before = await offlineRow(shop);
           stub.refresh = answer;
           await expect(
             shopifyRequest(shop, INSTALLATION_CHECK_QUERY),
@@ -3567,41 +4086,53 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         ).rejects.toMatchObject({ code: "NETWORK_TIMEOUT", retryable: true });
       });
 
-      it.each([401, 400])(
-        "a %i counts as a refusal: it is final, and the next sign-in mends it",
-        async (status) => {
-          const { shop } = await signIn();
-          await due(shop);
-          stub.refresh = () => stub.json({ error: "invalid_request" }, status);
-          await expect(
-            shopifyRequest(shop, INSTALLATION_CHECK_QUERY),
-          ).rejects.toMatchObject({ code: "AUTH_FAILURE", retryable: false });
-          const again = new Browser();
-          const { trips } = await atShopify(
-            again,
-            await startSignIn(again, shop),
-          );
-          expect(trips).toEqual(["online", "offline"]);
-        },
-      );
-
-      it("a 403 is this app's own credentials being refused: it is reported, and no new grant mends it", async () => {
+      it("a 401 is the one refusal Shopify documents: it is final, and the next sign-in mends it", async () => {
         const { shop } = await signIn();
         await due(shop);
-        stub.refresh = () => stub.json({ error: "invalid_client" }, 403);
+        stub.refresh = () => stub.json({ error: "invalid_request" }, 401);
         await expect(
           shopifyRequest(shop, INSTALLATION_CHECK_QUERY),
-        ).rejects.toMatchObject({
-          code: "CONFIGURATION_ERROR",
-          retryable: false,
-        });
+        ).rejects.toMatchObject({ code: "AUTH_FAILURE", retryable: false });
         const again = new Browser();
         const { trips } = await atShopify(
           again,
           await startSignIn(again, shop),
         );
-        expect(trips).toEqual(["online"]);
+        expect(trips).toEqual(["online", "offline"]);
       });
+
+      // Sent again it looks the same, and a new grant would retire a token that works.
+      it.each<[number, string]>([
+        [400, "a malformed body"],
+        [403, "bad client credentials"],
+        [404, "nothing there"],
+        [422, "a request it cannot take"],
+      ])(
+        "a %i is about this app's own request, here %s: it is reported, not retried, and no new grant is asked for",
+        async (status) => {
+          const { shop } = await signIn();
+          await due(shop);
+          const before = await offlineRow(shop);
+          stub.refresh = () => stub.json({ error: "invalid_client" }, status);
+          await expect(
+            shopifyRequest(shop, INSTALLATION_CHECK_QUERY),
+          ).rejects.toMatchObject({
+            code: "CONFIGURATION_ERROR",
+            retryable: false,
+            uncertain: false,
+          });
+          const again = new Browser();
+          const { trips } = await atShopify(
+            again,
+            await startSignIn(again, shop),
+          );
+          expect(trips).toEqual(["online"]);
+          expect(await offlineRow(shop)).toMatchObject({
+            accessToken: before.accessToken,
+            refreshToken: before.refreshToken,
+          });
+        },
+      );
 
       it("a row this key cannot open reads as authorization that has to be granted again", async () => {
         const { shop } = await signIn();
@@ -3645,19 +4176,654 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)(
         },
       );
 
-      it.each([401, 400])(
-        "the worker gives up on a %i, as an authorization failure",
+      it("the worker gives up on a 401, as an authorization failure", async () => {
+        const { shop } = await signIn();
+        await due(shop);
+        stub.refresh = () => stub.json({ error: "invalid_request" }, 401);
+        const job = await catalogJob(shop);
+        expect(await runJob(job.id)).toMatchObject({
+          status: "DEAD_LETTER",
+          lastError: expect.stringContaining("AUTH_FAILURE"),
+        });
+      });
+
+      it.each([400, 403])(
+        "the worker gives up on a %i too, as a problem with this app rather than with the token",
         async (status) => {
           const { shop } = await signIn();
           await due(shop);
-          stub.refresh = () => stub.json({ error: "invalid_request" }, status);
+          stub.refresh = () => stub.json({ error: "invalid_client" }, status);
           const job = await catalogJob(shop);
           expect(await runJob(job.id)).toMatchObject({
             status: "DEAD_LETTER",
-            lastError: expect.stringContaining("AUTH_FAILURE"),
+            lastError: expect.stringContaining("CONFIGURATION_ERROR"),
           });
         },
       );
+
+      describe("two minutes before it expires, which is already inside the window", () => {
+        const nearlyDue = (shop: string) =>
+          prisma.session.update({
+            where: { id: `offline_${shop}` },
+            data: { expires: new Date(Date.now() + 2 * MINUTE) },
+          });
+
+        it("a 401 is still read here, and is final", async () => {
+          const { shop } = await signIn();
+          await nearlyDue(shop);
+          stub.refresh = () => stub.json({ error: "invalid_request" }, 401);
+          await expect(offlineExecutor(shop)).rejects.toMatchObject({
+            code: "AUTH_FAILURE",
+            retryable: false,
+          });
+          expect(refreshesPresented()).toHaveLength(1);
+        });
+
+        it("a 503 is still read here, and is worth retrying", async () => {
+          const { shop } = await signIn();
+          await nearlyDue(shop);
+          stub.refresh = () => stub.json({ errors: "unavailable" }, 503);
+          await expect(offlineExecutor(shop)).rejects.toMatchObject({
+            code: "NETWORK_TIMEOUT",
+            retryable: true,
+            message: expect.stringContaining("could not renew"),
+          });
+          expect(refreshesPresented()).toHaveLength(1);
+        });
+      });
+    });
+
+    describe("one token operation for a store at a time", () => {
+      it("two calls for a due token refresh it once, and both go on with the new token", async () => {
+        const { shop } = await signIn();
+        await due(shop);
+        const rotated = offlineGrant();
+        const answer = held<Response>();
+        stub.refresh = () => answer.answer;
+        const both = Promise.all([
+          offlineExecutor(shop),
+          offlineExecutor(shop),
+        ]);
+        await until(() => refreshesPresented().length);
+        await until(tokenLockWaiters);
+        expect(refreshesPresented()).toHaveLength(1);
+        answer.release(stub.json(rotated));
+        const executors = await both;
+        expect(refreshesPresented()).toHaveLength(1);
+        for (const execute of executors) {
+          await execute(INSTALLATION_CHECK_QUERY, {});
+          expect(stub.outbound.at(-1)?.token).toBe(rotated.access_token);
+        }
+        expect(await workerRefreshToken(shop)).toBe(rotated.refresh_token);
+      });
+
+      it("two stores do not wait on each other", async () => {
+        const a = await signIn(shopName("lock-a"));
+        const b = await signIn(shopName("lock-b"));
+        await due(a.shop);
+        await due(b.shop);
+        const rotatedA = offlineGrant();
+        const rotatedB = offlineGrant();
+        const answerA = held<Response>();
+        stub.refresh = (_, shop) =>
+          shop === a.shop ? answerA.answer : stub.json(rotatedB);
+        const first = offlineExecutor(a.shop);
+        await until(() => refreshesPresented().length);
+        await offlineExecutor(b.shop);
+        expect(refreshesPresented()).toHaveLength(2);
+        expect(await workerRefreshToken(b.shop)).toBe(rotatedB.refresh_token);
+        answerA.release(stub.json(rotatedA));
+        await first;
+        expect(await workerRefreshToken(a.shop)).toBe(rotatedA.refresh_token);
+      });
+
+      it("the next in line tries for itself after a failure, one at a time and with the same token", async () => {
+        const { shop } = await signIn();
+        await due(shop);
+        const refreshToken = await workerRefreshToken(shop);
+        const rotated = offlineGrant();
+        let calls = 0;
+        let running = 0;
+        let mostRunning = 0;
+        stub.refresh = async () => {
+          calls += 1;
+          const call = calls;
+          running += 1;
+          mostRunning = Math.max(mostRunning, running);
+          await pause(50);
+          running -= 1;
+          return call === 1
+            ? stub.json({ errors: "unavailable" }, 503)
+            : stub.json(rotated);
+        };
+        const outcomes = await Promise.allSettled([
+          offlineExecutor(shop),
+          offlineExecutor(shop),
+        ]);
+        expect(mostRunning).toBe(1);
+        expect(refreshesPresented().map((body) => body.refresh_token)).toEqual([
+          refreshToken,
+          refreshToken,
+        ]);
+        expect(outcomes.map(({ status }) => status).sort()).toEqual([
+          "fulfilled",
+          "rejected",
+        ]);
+        const failed = outcomes.find(({ status }) => status === "rejected");
+        expect((failed as PromiseRejectedResult).reason).toMatchObject({
+          code: "NETWORK_TIMEOUT",
+          retryable: true,
+        });
+        expect(await workerRefreshToken(shop)).toBe(rotated.refresh_token);
+      });
+
+      it("a refresh answering after the deadline leaves the job to retry and the old row as it was", async () => {
+        const { shop } = await signIn();
+        await due(shop);
+        const before = await offlineRow(shop);
+        shortenTokenDeadline();
+        let answered = false;
+        stub.refresh = async () => {
+          await pause(100);
+          answered = true;
+          return stub.json(offlineGrant());
+        };
+        const job = await catalogJob(shop);
+        expect(await runJob(job.id)).toMatchObject({
+          status: "RETRY",
+          lastError: expect.stringContaining("NETWORK_TIMEOUT"),
+        });
+        await putAside(job.id);
+        await until(() => answered);
+        await pause(50);
+        expect(await offlineRow(shop)).toMatchObject({
+          accessToken: before.accessToken,
+          refreshToken: before.refreshToken,
+        });
+        // Nothing is left holding the lock, and the same token goes again.
+        const rotated = offlineGrant();
+        stub.refresh = () => stub.json(rotated);
+        await offlineExecutor(shop);
+        expect(await workerRefreshToken(shop)).toBe(rotated.refresh_token);
+      });
+
+      /** A person whose sign-in found the offline token dead, about to get a new one. */
+      const atRepairTrip = async (shop: string) => {
+        const normal = stub.graphql;
+        stub.graphql = () => stub.json({ errors: "Invalid token" }, 401);
+        const browser = new Browser();
+        const started = await startSignIn(browser, shop);
+        stub.grants.set("person", onlineGrant(OWNER));
+        const repair = await browser.visit(
+          callback,
+          shopifyCallback(authorizeUrl(started), "person"),
+        );
+        stub.graphql = normal;
+        const authorize = authorizeUrl(repair);
+        expect(isOnlineAsk(authorize)).toBe(false);
+        stub.tokenRequests.length = 0;
+        return { browser, authorize };
+      };
+      /**
+       * Shopify's rules as documented: a grant retires every other refresh token at
+       * once, and a refresh that a grant overtakes answers with one already retired.
+       */
+      const shopifyRotation = (
+        first: string,
+        grant: { refresh_token: string },
+      ) => {
+        const usable = new Set([first]);
+        const gate = {
+          refresh: Promise.resolve(),
+          exchange: Promise.resolve(),
+        };
+        stub.exchanging = async () => {
+          usable.clear();
+          usable.add(grant.refresh_token);
+          await gate.exchange;
+        };
+        stub.refresh = async (body) => {
+          if (!usable.has(body.refresh_token))
+            return stub.json({ error: "invalid_request" }, 401);
+          const next = offlineGrant();
+          await gate.refresh;
+          if (usable.has(body.refresh_token)) usable.add(next.refresh_token);
+          return stub.json(next);
+        };
+        return { usable, gate };
+      };
+
+      it("a repair that comes back during a refresh waits for it, and its own token is the one kept", async () => {
+        const { shop } = await signIn();
+        const refreshToken = await workerRefreshToken(shop);
+        const { browser, authorize } = await atRepairTrip(shop);
+        const grant = offlineGrant();
+        stub.grants.set("repair", grant);
+        const { gate, usable } = shopifyRotation(refreshToken!, grant);
+        const answer = held<void>();
+        gate.refresh = answer.answer;
+        await due(shop);
+        const refreshing = offlineExecutor(shop);
+        await until(() => refreshesPresented().length);
+        const repairing = browser.visit(
+          callback,
+          shopifyCallback(authorize, "repair"),
+        );
+        await until(tokenLockWaiters);
+        expect(codesPresented()).toEqual([]);
+        answer.release();
+        await refreshing;
+        expect((await repairing).location).toBe(dashboard(shop));
+        expect(codesPresented()).toHaveLength(1);
+        expect(await workerRefreshToken(shop)).toBe(grant.refresh_token);
+        expect(usable.has(grant.refresh_token)).toBe(true);
+        // What the worker holds now is what Shopify will take next time.
+        await due(shop);
+        await expect(offlineExecutor(shop)).resolves.toBeDefined();
+      });
+
+      it("a refresh that comes during a repair waits for it, and then has nothing to do", async () => {
+        const { shop } = await signIn();
+        const refreshToken = await workerRefreshToken(shop);
+        const { browser, authorize } = await atRepairTrip(shop);
+        const grant = offlineGrant();
+        stub.grants.set("repair", grant);
+        const { gate } = shopifyRotation(refreshToken!, grant);
+        const answer = held<void>();
+        gate.exchange = answer.answer;
+        await due(shop);
+        const repairing = browser.visit(
+          callback,
+          shopifyCallback(authorize, "repair"),
+        );
+        await until(() => codesPresented().length);
+        const refreshing = offlineExecutor(shop);
+        await until(tokenLockWaiters);
+        answer.release();
+        expect((await repairing).location).toBe(dashboard(shop));
+        const execute = await refreshing;
+        expect(refreshesPresented()).toEqual([]);
+        await execute(INSTALLATION_CHECK_QUERY, {});
+        expect(stub.outbound.at(-1)?.token).toBe(grant.access_token);
+      });
+
+      it("a person's trip answered with an offline token keeps it over a refresh still in flight", async () => {
+        const { shop } = await signIn();
+        const browser = new Browser();
+        const authorize = authorizeUrl(await startSignIn(browser, shop));
+        const grant = offlineGrant();
+        stub.grants.set("edited-url", grant);
+        const answer = held<Response>();
+        stub.refresh = () => answer.answer;
+        await due(shop);
+        const refreshing = offlineExecutor(shop);
+        await until(() => refreshesPresented().length);
+        const refusing = browser.visit(
+          callback,
+          shopifyCallback(authorize, "edited-url"),
+        );
+        await until(tokenLockWaiters);
+        answer.release(stub.json(offlineGrant()));
+        await refreshing;
+        expect((await refusing).status).toBe(400);
+        expect(await workerRefreshToken(shop)).toBe(grant.refresh_token);
+      });
+
+      it("keeps such a token even if the wait comes to nothing, since the old one is already gone", async () => {
+        const { shop } = await signIn();
+        const browser = new Browser();
+        const authorize = authorizeUrl(await startSignIn(browser, shop));
+        const grant = offlineGrant();
+        stub.grants.set("edited-url", grant);
+        const release = await tokenLockHeldElsewhere(shop);
+        try {
+          shortenTokenLock({ lockWait: 50 });
+          const told = await browser.visit(
+            callback,
+            shopifyCallback(authorize, "edited-url"),
+          );
+          expect(told.status).toBe(400);
+          expect(await workerRefreshToken(shop)).toBe(grant.refresh_token);
+        } finally {
+          await release();
+        }
+      });
+
+      it("a person's own trip does not wait for it", async () => {
+        const { shop } = await signIn();
+        const release = await tokenLockHeldElsewhere(shop);
+        try {
+          const browser = new Browser();
+          const { trips, final } = await atShopify(
+            browser,
+            await startSignIn(browser, shop),
+          );
+          expect(trips).toEqual(["online"]);
+          expect(final.location).toBe(dashboard(shop));
+          expect(await tokenLockWaiters()).toBe(0);
+        } finally {
+          await release();
+        }
+      });
+
+      it("a sign-in that has to refresh, or to repair, is not holding the lock it wants", async () => {
+        const { shop } = await signIn();
+        await due(shop);
+        const rotated = offlineGrant();
+        stub.refresh = () => stub.json(rotated);
+        const first = await signIn(shop, OWNER, new Browser());
+        expect(first.trips).toEqual(["online"]);
+        expect(await workerRefreshToken(shop)).toBe(rotated.refresh_token);
+        await due(shop);
+        stub.refresh = () => stub.json({ error: "invalid_request" }, 401);
+        const second = await signIn(shop, OWNER, new Browser());
+        expect(second.trips).toEqual(["online", "offline"]);
+      });
+
+      it("a transaction that runs out during a refresh is worth retrying, drops the answer, and leaves the row", async () => {
+        const { shop } = await signIn();
+        await due(shop);
+        const before = await offlineRow(shop);
+        shortenTokenLock({ timeout: 100 });
+        stub.refresh = async () => {
+          await pause(400);
+          return stub.json(offlineGrant());
+        };
+        await expect(offlineExecutor(shop)).rejects.toMatchObject({
+          code: "NETWORK_TIMEOUT",
+          retryable: true,
+        });
+        expect(await offlineRow(shop)).toMatchObject({
+          accessToken: before.accessToken,
+          refreshToken: before.refreshToken,
+        });
+        // The token it presented still works, so the retry is safe.
+        vi.restoreAllMocks();
+        const rotated = offlineGrant();
+        stub.refresh = () => stub.json(rotated);
+        await offlineExecutor(shop);
+        expect(await workerRefreshToken(shop)).toBe(rotated.refresh_token);
+      });
+
+      it("a 401 that comes back once the transaction has run out is worth retrying: a repair may have taken the lock and overtaken it", async () => {
+        const { shop } = await signIn();
+        const refreshToken = await workerRefreshToken(shop);
+        const { browser, authorize } = await atRepairTrip(shop);
+        const grant = offlineGrant();
+        stub.grants.set("repair", grant);
+        // Shopify reads the token when it answers, by which time the grant has retired it.
+        const usable = new Set([refreshToken]);
+        stub.exchanging = () => {
+          usable.clear();
+          usable.add(grant.refresh_token);
+        };
+        const answer = held<void>();
+        stub.refresh = async (body) => {
+          await answer.answer;
+          return usable.has(body.refresh_token)
+            ? stub.json(offlineGrant())
+            : stub.json({ error: "invalid_request" }, 401);
+        };
+        // Only the refresh's transaction is short.
+        let first = true;
+        reachIntoTransactions((work, options) => {
+          const shorter = first ? { timeout: 100 } : {};
+          first = false;
+          return [work, { ...options, ...shorter }];
+        });
+        await due(shop);
+        const refreshing = offlineExecutor(shop);
+        await until(() => refreshesPresented().length);
+        await pause(300);
+        expect(
+          (await browser.visit(callback, shopifyCallback(authorize, "repair")))
+            .location,
+        ).toBe(dashboard(shop));
+        answer.release();
+        await expect(refreshing).rejects.toMatchObject({
+          code: "NETWORK_TIMEOUT",
+          retryable: true,
+        });
+        expect(await workerRefreshToken(shop)).toBe(grant.refresh_token);
+        // And the retry has nothing to do but use it.
+        vi.restoreAllMocks();
+        const execute = await offlineExecutor(shop);
+        await execute(INSTALLATION_CHECK_QUERY, {});
+        expect(stub.outbound.at(-1)?.token).toBe(grant.access_token);
+      });
+
+      it("a transaction that runs out before the refresh is sent sends nothing, and is worth retrying", async () => {
+        const { shop } = await signIn();
+        await due(shop);
+        shortenTokenLock({ timeout: 100 });
+        const read = sessionStorage.loadSession.bind(sessionStorage);
+        let reads = 0;
+        vi.spyOn(sessionStorage, "loadSession").mockImplementation(
+          async (id) => {
+            reads += 1;
+            // The second is the read under the lock, on a slow database, say.
+            if (reads === 2) await pause(300);
+            return read(id);
+          },
+        );
+        await expect(offlineExecutor(shop)).rejects.toMatchObject({
+          code: "NETWORK_TIMEOUT",
+          retryable: true,
+        });
+        expect(reads).toBe(2);
+        expect(refreshesPresented()).toEqual([]);
+      });
+
+      it("a transaction that runs out while it waits for the lock is worth retrying, and sends nothing", async () => {
+        const { shop } = await signIn();
+        await due(shop);
+        const release = await tokenLockHeldElsewhere(shop);
+        shortenTokenLock({ timeout: 100 });
+        const waiting = expect(offlineExecutor(shop)).rejects.toMatchObject({
+          code: "NETWORK_TIMEOUT",
+          retryable: true,
+        });
+        await pause(300);
+        await release();
+        await waiting;
+        expect(refreshesPresented()).toEqual([]);
+      });
+
+      it("a wait for the lock that runs out is worth retrying, and sends nothing", async () => {
+        const { shop } = await signIn();
+        await due(shop);
+        const release = await tokenLockHeldElsewhere(shop);
+        try {
+          shortenTokenLock({ lockWait: 50 });
+          await expect(offlineExecutor(shop)).rejects.toMatchObject({
+            code: "NETWORK_TIMEOUT",
+            retryable: true,
+          });
+          expect(refreshesPresented()).toEqual([]);
+        } finally {
+          await release();
+        }
+      });
+
+      it("a sign-in that cannot get the lock for its repair spends no code, says so, and can try again", async () => {
+        const { shop } = await signIn();
+        const { browser, authorize } = await atRepairTrip(shop);
+        const release = await tokenLockHeldElsewhere(shop);
+        try {
+          shortenTokenLock({ lockWait: 50 });
+          stub.grants.set("repair", offlineGrant());
+          const told = await browser.visit(
+            callback,
+            shopifyCallback(authorize, "repair"),
+          );
+          expect(told.status).toBe(503);
+          expect(told.data).toEqual({
+            problem: expect.stringContaining("Sign in again"),
+          });
+          expect(codesPresented()).toEqual([]);
+        } finally {
+          await release();
+        }
+        vi.restoreAllMocks();
+        stub.graphql = () => stub.json({ errors: "Invalid token" }, 401);
+        const again = await atShopify(
+          browser,
+          await startSignIn(browser, shop),
+        );
+        expect(again.trips).toEqual(["online", "offline"]);
+      });
+
+      it("a sign-in whose repair cannot even start the lock's transaction spends no code either", async () => {
+        const { shop } = await signIn();
+        const { browser, authorize } = await atRepairTrip(shop);
+        stub.grants.set("repair", offlineGrant());
+        // What Prisma says when no connection comes within maxWait.
+        vi.spyOn(prisma, "$transaction").mockRejectedValueOnce(
+          new Error(
+            "Transaction API error: Unable to start a transaction in the given time.",
+          ),
+        );
+        const told = await browser.visit(
+          callback,
+          shopifyCallback(authorize, "repair"),
+        );
+        expect(told.status).toBe(503);
+        expect(told.data).toEqual({
+          problem: expect.stringContaining("Nothing was changed"),
+        });
+        expect(codesPresented()).toEqual([]);
+      });
+
+      it("a repair whose grant cannot be stored is an error and not a busy lock: the code is spent by then", async () => {
+        const { shop } = await signIn();
+        const { browser, authorize } = await atRepairTrip(shop);
+        stub.grants.set("repair", offlineGrant());
+        const warn = vi.spyOn(logger, "warn");
+        vi.spyOn(sessionStorage, "storeSession").mockRejectedValueOnce(
+          new Error("The session table went away"),
+        );
+        await expect(
+          browser.visit(callback, shopifyCallback(authorize, "repair")),
+        ).rejects.toThrow("The session table went away");
+        expect(codesPresented()).toHaveLength(1);
+        expect(JSON.stringify(warn.mock.calls)).not.toContain("TOKEN_BUSY");
+      });
+
+      it("a repair whose transaction runs out once the grant is stored still signs in, and keeps the grant", async () => {
+        const { shop } = await signIn();
+        const { browser, authorize } = await atRepairTrip(shop);
+        const grant = offlineGrant();
+        stub.grants.set("repair", grant);
+        shortenTokenLock({ timeout: 100 });
+        stub.exchanging = () => pause(300);
+        expect(
+          await browser.visit(callback, shopifyCallback(authorize, "repair")),
+        ).toMatchObject({ status: 302, location: dashboard(shop) });
+        expect(codesPresented()).toHaveLength(1);
+        expect(await workerRefreshToken(shop)).toBe(grant.refresh_token);
+      });
+
+      it("gives whoever gets the lock a whole deadline, and a waiter as long as one holder takes", async () => {
+        const { shop } = await signIn();
+        await due(shop);
+        let inside!: Prisma.TransactionClient;
+        let lockWait = 0;
+        const started = reachIntoTransactions((work, options) => [
+          (tx) => {
+            inside = tx;
+            return work(tx);
+          },
+          options,
+        ]);
+        stub.refresh = async () => {
+          const [{ setting }] = await inside.$queryRaw<{ setting: string }[]>`
+            SELECT setting FROM pg_settings WHERE name = 'lock_timeout'`;
+          lockWait = Number(setting);
+          return stub.json(offlineGrant());
+        };
+        await offlineExecutor(shop);
+        const options = started.mock.calls[0][1] as {
+          maxWait: number;
+          timeout: number;
+        };
+        expect(lockWait).toBeGreaterThan(TOKEN_DEADLINE_MS);
+        expect(options.timeout).toBeGreaterThan(lockWait + TOKEN_DEADLINE_MS);
+        expect(options.maxWait).toBeGreaterThan(0);
+      });
+
+      it("leaves that limit behind with the transaction, so no other lock on these connections gets it", async () => {
+        const { shop } = await signIn();
+        await due(shop);
+        stub.refresh = () => stub.json(offlineGrant());
+        await offlineExecutor(shop);
+        // Enough at once, each taking a moment, to reach every connection in the pool:
+        // Prisma's default is two for each processor and one more.
+        const everyConnection = await Promise.all(
+          Array.from(
+            { length: availableParallelism() * 2 + 1 },
+            () =>
+              prisma.$queryRaw<{ setting: string }[]>`
+                SELECT setting, pg_sleep(0.05)::text FROM pg_settings WHERE name = 'lock_timeout'`,
+          ),
+        );
+        expect(
+          new Set(everyConnection.map(([{ setting }]) => setting)),
+        ).toEqual(new Set(["0"]));
+      });
+
+      it("the lock is this store's and this purpose's", async () => {
+        const { shop } = await signIn();
+        await due(shop);
+        const rotated = offlineGrant();
+        stub.refresh = () => stub.json(rotated);
+        // Another advisory lock on this store's name is another matter.
+        const other = held<void>();
+        const got = held<void>();
+        const elsewhere = prisma.$transaction(
+          async (tx) => {
+            await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`catalog:${shop}`}))::text`;
+            got.release();
+            await other.answer;
+          },
+          { timeout: 10_000 },
+        );
+        await got.answer;
+        await offlineExecutor(shop);
+        other.release();
+        await elsewhere;
+        expect(await workerRefreshToken(shop)).toBe(rotated.refresh_token);
+      });
+
+      it("a refresh that comes due inside another transaction, which is where the worker's writes reach it, gets through", async () => {
+        const { shop } = await signIn();
+        await due(shop);
+        const rotated = offlineGrant();
+        stub.refresh = () => stub.json(rotated);
+        // That transaction, the lock's and the session adapter's: three at once.
+        await prisma.$transaction(
+          async (tx) => {
+            await tx.$queryRaw`SELECT 1`;
+            const execute = await offlineExecutor(shop);
+            await execute(INSTALLATION_CHECK_QUERY, {});
+          },
+          { timeout: 20_000 },
+        );
+        expect(refreshesPresented()).toHaveLength(1);
+        expect(stub.outbound.at(-1)?.token).toBe(rotated.access_token);
+      });
+
+      it("a token just outside what the library would refresh by itself is renewed here, under the lock", async () => {
+        const { shop } = await signIn();
+        await prisma.session.update({
+          where: { id: `offline_${shop}` },
+          data: { expires: new Date(Date.now() + 5.5 * MINUTE) },
+        });
+        const started = vi.spyOn(prisma, "$transaction");
+        stub.refresh = () => stub.json(offlineGrant());
+        await offlineExecutor(shop);
+        expect(refreshesPresented()).toHaveLength(1);
+        expect(started).toHaveBeenCalled();
+      });
     });
 
     describe("the worker", () => {

@@ -134,33 +134,34 @@ test("a real browser signs in to two stores at once, pairs them, and each tab st
   await new Promise<void>((resolve) =>
     listener.listen(LISTENER_PORT, "127.0.0.1", resolve),
   );
-  const server = spawn(
-    process.execPath,
-    [
-      "--import",
-      "./tests/e2e/shopify-stub.mjs",
-      "scripts/serve.mjs",
-      "./build/server/index.js",
-    ],
-    {
-      env: {
-        ...process.env,
-        NODE_ENV: "production",
-        PORT: String(PORT),
-        SHOPIFY_API_KEY: "synthetic-browser-test-key",
-        SHOPIFY_API_SECRET: SECRET,
-        SHOPIFY_APP_URL: BASE,
-        SCOPES:
-          "read_products,write_products,read_inventory,write_inventory,read_locations",
-        SYNC_WRITE_ENABLED: "false",
-        INVENTORY_WRITE_ENABLED: "false",
+  const startServer = () =>
+    spawn(
+      process.execPath,
+      [
+        "--import",
+        "./tests/e2e/shopify-stub.mjs",
+        "scripts/serve.mjs",
+        "./build/server/index.js",
+      ],
+      {
+        env: {
+          ...process.env,
+          NODE_ENV: "production",
+          PORT: String(PORT),
+          SHOPIFY_API_KEY: "synthetic-browser-test-key",
+          SHOPIFY_API_SECRET: SECRET,
+          SHOPIFY_APP_URL: BASE,
+          SCOPES:
+            "read_products,write_products,read_inventory,write_inventory,read_locations",
+          SYNC_WRITE_ENABLED: "false",
+          INVENTORY_WRITE_ENABLED: "false",
+        },
+        stdio: "ignore",
       },
-      stdio: "ignore",
-    },
-  );
-  const database = new PrismaClient();
-  try {
-    await expect
+    );
+  let server = startServer();
+  const serverAnswers = () =>
+    expect
       .poll(
         () =>
           fetch(`${BASE}/health`)
@@ -169,6 +170,9 @@ test("a real browser signs in to two stores at once, pairs them, and each tab st
         { timeout: 20_000 },
       )
       .toBe(200);
+  const database = new PrismaClient();
+  try {
+    await serverAnswers();
     const context = await browser!.newContext({
       ignoreHTTPSErrors: true,
       userAgent: USER_AGENT,
@@ -443,6 +447,39 @@ test("a real browser signs in to two stores at once, pairs them, and each tab st
     });
     await tabRevoked.waitForSelector("#destinationShop");
     await tabRevoked.close();
+
+    // Logged out of Shopify and only reading: the next menu click leaves the app as a
+    // whole page, signs in again and comes back to that page, and no other store is
+    // touched. A restart forgets what Shopify last said, as three minutes would.
+    const reading = store("revoked");
+    const tabReading = watch(await context.newPage());
+    await openFromShopify(tabReading, reading);
+    await tabReading.evaluate(() => {
+      (window as unknown as { stayed: boolean }).stayed = true;
+    });
+    const readingCookie = await sessionCookie(reading);
+    const stopped = new Promise((resolve) => server.once("exit", resolve));
+    server.kill("SIGTERM");
+    await stopped;
+    server = startServer();
+    await serverAnswers();
+    grants.length = 0;
+    await tabReading
+      .locator(`nav.sp-nav a[href="${dashboard(reading, "/app/stores")}"]`)
+      .click();
+    await tabReading.waitForURL(`${BASE}${dashboard(reading, "/app/stores")}`, {
+      timeout: 15_000,
+    });
+    await tabReading.waitForSelector("#destinationShop");
+    expect(grants).toEqual([{ shop: reading, online: true }]);
+    expect(await sessionCookie(reading)).not.toBe(readingCookie);
+    expect(await sessionCookie(a)).toBe(held);
+    expect(
+      await tabReading.evaluate(
+        () => (window as unknown as { stayed?: boolean }).stayed,
+      ),
+    ).toBeUndefined();
+    await tabReading.close();
 
     // Shopify does not answer: told to try again, still signed in, nothing applied.
     const down = store("shopify-down");
